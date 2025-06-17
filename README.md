@@ -251,4 +251,5 @@ You don’t need to write extra caching code, manage Redis keys manually, or wor
 
 # Disclaimer
 
-Say that this library is a personal library not related in any way to the Redis Inc. company, but leverages the Redis technology.
+Kinexis is a personal project and is **not affiliated with or endorsed by Redis Inc.** in any way.
+It is an independent library that leverages **Redis** as a caching and streaming technology to implement well-known caching patterns such as Cache-Aside, Write-Behind, and Refresh-Ahead.
