@@ -93,6 +93,11 @@ By handling the complexity of these patterns internally, Kinexis helps reduce bo
 The reliability promise of Kinexis is rooted in its use of **Redis Streams** combined with Redis's **persistence mechanisms**, which ensure that no data is lost.
 Every write operation goes first into a Redis Stream, making it durable and traceable. From there, the actual data is created and stored in a structured format such as a **Redis Hash** or **Redis JSON**, ready to be queried and mapped to application-level objects.
 
+Here is the high level architecture diagram:
+
+<p align="center"><img src="kinexis-hla.png" width="800" alt="Kinexis Architecture Diagram" /></p>
+
+
 From a developer’s perspective, Kinexis is intentionally simple and non-intrusive. It revolves around three key components:
 
 * A single annotation: `@CachingPatterns`
