@@ -71,7 +71,7 @@ public abstract class AbstractKeyExpirationListener<T> implements MessageListene
         if (key.startsWith(getKeyPrefix())) {
             logger.debug("Processing expired key: {}", key);
             String id = key.substring(getKeyPrefix().length());
-            Optional<T> reloadedEntity = getService().reloadById(id);
+            Optional<T> reloadedEntity = getService().findById(id);
             logger.debug("Expired entity({}) reloaded: {}", key, reloadedEntity);
         } else {
             logger.debug("Ignoring expired key (prefix {} do not match with the key): {}", getKeyPrefix(), key);

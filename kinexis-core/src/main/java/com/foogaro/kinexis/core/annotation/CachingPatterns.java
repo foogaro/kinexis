@@ -1,6 +1,8 @@
 package com.foogaro.kinexis.core.annotation;
 
-import com.foogaro.kinexis.core.service.CachingPattern;
+import com.foogaro.kinexis.core.model.CachingFormat;
+import com.foogaro.kinexis.core.model.CachingPattern;
+import com.foogaro.kinexis.core.processor.CachingPatternsAnnotationProcessor;
 
 import java.lang.annotation.*;
 
@@ -31,6 +33,12 @@ public @interface CachingPatterns {
      * @return array of caching patterns
      */
     CachingPattern[] patterns() default {CachingPattern.NONE};
+
+    /**
+     * Specifies in which format, HASH or JSON document, the entity will be stored into the Cache.
+     * @return the caching format, which is {@link CachingFormat#JSON} by default.
+     */
+    CachingFormat format() default CachingFormat.JSON;
 
     /**
      * Specifies whether the caching patterns should be enabled by default.

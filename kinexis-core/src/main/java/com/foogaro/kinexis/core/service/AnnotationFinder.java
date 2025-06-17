@@ -1,5 +1,6 @@
 package com.foogaro.kinexis.core.service;
 
+import com.foogaro.kinexis.core.model.CachingPattern;
 import com.foogaro.kinexis.core.annotation.CachingPatterns;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

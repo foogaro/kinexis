@@ -38,6 +38,16 @@ curl -X POST http://localhost:8080/api/employers \
   "phone": "4122334455"
 }'
 
+curl -X POST http://localhost:8080/api/employers \
+-H "Content-Type: application/json" \
+-d '{
+  "id": 5,
+  "name": "5Updated Tech Solutions Ltd.",
+  "address": "55678 Future Drive, Innovation City",
+  "email": "5newcontact@techsolutions.com",
+  "phone": "5122334455"
+}'
+
 curl -X PUT http://localhost:8080/api/employers/1 \
 -H "Content-Type: application/json" \
 -d '{
@@ -50,3 +60,10 @@ curl -X PUT http://localhost:8080/api/employers/1 \
 curl -X DELETE http://localhost:8080/api/employers/3
 
 INSERT INTO employers (id, address, email, name, phone) VALUES (2, 'Via Roma 2', 'luigi.2@redis.com', 'Luigi', '2222222222');
+INSERT INTO employers (id, address, email, name, phone) VALUES (2, 'Via Roma 2', 'luigi.2@redis.com', 'Luigi', '2222222222');
+
+ALTER TABLE `redis`.`employers` DROP COLUMN `phone`;
+
+curl -X GET http://localhost:8080/api/employers/2
+
+EXPIRE com.foogaro.redis.demo.entity.Employer:2 10

@@ -9,8 +9,8 @@ import org.springframework.data.redis.repository.configuration.EnableRedisReposi
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 @SpringBootApplication
-@EnableRedisRepositories(basePackages = "com.foogaro.redis.demo.repository.redis")
-@EnableJpaRepositories(basePackages = "com.foogaro.redis.demo.repository.jpa")
+@EnableRedisRepositories(basePackages = "com.foogaro.redis.demo.entity")
+@EnableJpaRepositories(basePackages = "com.foogaro.redis.demo.repository")
 @EnableScheduling
 @Import(KinexisConfiguration.class)  // Add this
 public class WorkApplication {

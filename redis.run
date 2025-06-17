@@ -1,1 +1,3 @@
-docker run -it --rm=true --name=redis -p 6379:6379 -p 8001:8001 redis/redis-stack-server:7.2.0-v10
+# docker run -it --rm=true --name=redis -p 6379:6379 -p 8001:8001 redis/redis-stack-server:7.2.0-v10
+# docker run -it --rm=true --name=redis -p 6379:6379 -p 8001:8001 redis:8.0.2-alpine
+docker run -it --rm=true --name=redis -v ./redis-data:/data -p 6379:6379 -p 8001:8001 redis:8.0.2-alpine redis-server --appendonly yes --appendfsync always

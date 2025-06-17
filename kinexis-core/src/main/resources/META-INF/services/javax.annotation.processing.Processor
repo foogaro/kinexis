@@ -1,1 +1,1 @@
-com.foogaro.kinexis.core.annotation.CachingPatternsAnnotationProcessor
+com.foogaro.kinexis.core.processor.CachingPatternsAnnotationProcessor

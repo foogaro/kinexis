@@ -79,6 +79,17 @@ public abstract class KinexisService<T> {
     }
 
     /**
+     * Updates an entity to the cache or initiates a write-behind operation.
+     * If write-behind is enabled for the entity type, the operation is queued for asynchronous processing.
+     * Otherwise, the entity is written directly to the cache.
+     *
+     * @param entity the entity to update
+     */
+    public void update(T entity) {
+        save(entity);
+    }
+
+    /**
      * Reloads an entity from the database and updates the cache.
      * This method implements the Cache-Aside pattern by reading from the database
      * and then updating the cache with the fresh data.
@@ -86,9 +97,9 @@ public abstract class KinexisService<T> {
      * @param id the identifier of the entity to reload
      * @return an Optional containing the reloaded entity if found
      */
-    public Optional<T> reloadById(Object id) {
-        return cacheAside(id);
-    }
+//    public Optional<T> reloadById(Object id) {
+//        return cacheAside(id);
+//    }
 
     /**
      * Finds an entity by its identifier.
@@ -189,7 +200,7 @@ public abstract class KinexisService<T> {
 
     private Optional<T> readFromCache(Object id) {
         Optional<T> entity = Optional.empty();
-        String repositoryName = "Redis" + entityClass.getSimpleName() + "Repository";
+        String repositoryName = entityClass.getSimpleName() + "RedisRepository";
         Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
         if (repository instanceof KeyValueRepository) {
             @SuppressWarnings("unchecked")
@@ -204,7 +215,7 @@ public abstract class KinexisService<T> {
 
     private void deleteFromCache(Object id) {
         if (Objects.nonNull(id)) {
-            String repositoryName = "Redis" + entityClass.getSimpleName() + "Repository";
+            String repositoryName = entityClass.getSimpleName() + "RedisRepository";
             Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
             if (repository instanceof KeyValueRepository) {
                 @SuppressWarnings("unchecked")
@@ -221,7 +232,7 @@ public abstract class KinexisService<T> {
 
     private Optional<T> writeToCache(T entity) {
         if (Objects.nonNull(entity)) {
-            String repositoryName = "Redis" + entityClass.getSimpleName() + "Repository";
+            String repositoryName = entityClass.getSimpleName() + "RedisRepository";
             Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
             if (repository instanceof KeyValueRepository) {
                 @SuppressWarnings("unchecked")
@@ -240,7 +251,7 @@ public abstract class KinexisService<T> {
 
     private Optional<T> readFromDatabase(Object id) {
         Optional<T> entity = Optional.empty();
-        String repositoryName = "Jpa" + entityClass.getSimpleName() + "Repository";
+        String repositoryName = entityClass.getSimpleName() + "Repository";
         Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
         if (repository instanceof CrudRepository) {
             @SuppressWarnings("unchecked")
@@ -255,7 +266,7 @@ public abstract class KinexisService<T> {
 
     private void deleteFromDatabase(Object id) {
         if (Objects.nonNull(id)) {
-            String repositoryName = "Jpa" + entityClass.getSimpleName() + "Repository";
+            String repositoryName = entityClass.getSimpleName() + "Repository";
             Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
             if (repository instanceof CrudRepository) {
                 @SuppressWarnings("unchecked")
@@ -272,7 +283,7 @@ public abstract class KinexisService<T> {
 
     private Optional<T> writeToDatabase(T entity) {
         if (Objects.nonNull(entity)) {
-            String repositoryName = "Jpa" + entityClass.getSimpleName() + "Repository";
+            String repositoryName = entityClass.getSimpleName() + "Repository";
             Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
             if (repository instanceof CrudRepository) {
                 @SuppressWarnings("unchecked")

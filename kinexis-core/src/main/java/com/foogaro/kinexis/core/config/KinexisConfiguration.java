@@ -4,6 +4,10 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.foogaro.kinexis.core.service.AnnotationFinder;
 import com.foogaro.kinexis.core.service.BeanFinder;
+import io.lettuce.core.ClientOptions;
+import io.lettuce.core.SocketOptions;
+import io.lettuce.core.resource.ClientResources;
+import io.lettuce.core.resource.DefaultClientResources;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,11 +16,15 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
 import org.springframework.data.redis.connection.jedis.JedisConnectionFactory;
+import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
+import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
 import org.springframework.data.redis.serializer.GenericToStringSerializer;
@@ -53,6 +61,11 @@ public class KinexisConfiguration {
     public KinexisConfiguration() {
     }
 
+    @Bean
+    public Jedis jedis() {
+        return new Jedis(redis_host, redis_port);
+    }
+
     /**
      * Creates a Jedis connection factory for Redis if one doesn't already exist.
      * The factory is configured using the host and port from application properties.
@@ -61,13 +74,51 @@ public class KinexisConfiguration {
      */
     @Bean
     @ConditionalOnMissingBean(JedisConnectionFactory.class)
-    public JedisConnectionFactory redisConnectionFactory() {
+    public JedisConnectionFactory jedisConnectionFactory() {
         logger.debug("Creating JedisConnectionFactory");
         RedisStandaloneConfiguration config = new RedisStandaloneConfiguration();
         config.setHostName(redis_host);
         config.setPort(redis_port);
         logger.debug("Created JedisConnectionFactory");
         return new JedisConnectionFactory(config);
+    }
+
+    @Bean
+//    @ConditionalOnMissingBean(LettuceConnectionFactory.class)
+    public ClientResources clientResources() {
+        return DefaultClientResources.builder()
+                .ioThreadPoolSize(4)
+                .computationThreadPoolSize(4)
+                .build();
+    }
+
+    @Bean
+//    @ConditionalOnMissingBean(LettuceConnectionFactory.class)
+    public ClientOptions clientOptions() {
+        return ClientOptions.builder()
+                .socketOptions(SocketOptions.builder()
+                        .keepAlive(true)
+                        .tcpNoDelay(true)
+                        .build())
+                .autoReconnect(true)
+                .disconnectedBehavior(ClientOptions.DisconnectedBehavior.ACCEPT_COMMANDS)
+                .build();
+    }
+
+    @Bean
+    @Primary
+//    @ConditionalOnMissingBean(LettuceConnectionFactory.class)
+    public LettuceConnectionFactory lettuceConnectionFactory(ClientResources clientResources, ClientOptions clientOptions) {
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+                .clientResources(clientResources)
+                .clientOptions(clientOptions)
+                .commandTimeout(Duration.ofSeconds(5))
+                .shutdownTimeout(Duration.ZERO)
+                .build();
+
+        RedisStandaloneConfiguration serverConfig = new RedisStandaloneConfiguration(redis_host, redis_port);
+
+        return new LettuceConnectionFactory(serverConfig, clientConfig);
     }
 
     /**
@@ -78,8 +129,8 @@ public class KinexisConfiguration {
      * @return a configured RedisTemplate instance
      */
     @Bean
-    @ConditionalOnMissingBean
-    public RedisTemplate<String, String> redisTemplate(RedisConnectionFactory connectionFactory) {
+//    @ConditionalOnMissingBean
+    public RedisTemplate<String, String> redisTemplate(LettuceConnectionFactory connectionFactory) {
         logger.debug("Creating RedisTemplate");
         RedisTemplate<String, String> template = new RedisTemplate<>();
         template.setConnectionFactory(connectionFactory);
@@ -89,6 +140,11 @@ public class KinexisConfiguration {
         template.setHashValueSerializer(new StringRedisSerializer());
         logger.debug("Created RedisTemplate: {}", template);
         return template;
+    }
+
+    @Bean
+    public StringRedisTemplate stringRedisTemplate(LettuceConnectionFactory connectionFactory) {
+        return new StringRedisTemplate(connectionFactory);
     }
 
     /**
@@ -139,7 +195,7 @@ public class KinexisConfiguration {
      */
     @Bean
     public StreamMessageListenerContainer<String, MapRecord<String, String, String>> streamMessageListenerContainer(
-            RedisConnectionFactory connectionFactory) {
+            LettuceConnectionFactory connectionFactory) {
         logger.debug("Creating StreamMessageListenerContainer");
         StreamMessageListenerContainer.StreamMessageListenerContainerOptions<String, MapRecord<String, String, String>> options =
                 StreamMessageListenerContainer.StreamMessageListenerContainerOptions
@@ -178,8 +234,7 @@ public class KinexisConfiguration {
      * @return a configured RedisMessageListenerContainer instance
      */
     @Bean
-    public RedisMessageListenerContainer redisMessageListenerContainer(
-            JedisConnectionFactory redisConnectionFactory) {
+    public RedisMessageListenerContainer redisMessageListenerContainer(LettuceConnectionFactory redisConnectionFactory) {
         logger.debug("Creating RedisMessageListenerContainer");
         RedisMessageListenerContainer container = new RedisMessageListenerContainer();
         container.setConnectionFactory(redisConnectionFactory);

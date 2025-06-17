@@ -1,4 +1,4 @@
-package com.foogaro.kinexis.core.service;
+package com.foogaro.kinexis.core.model;
 
 /**
  * Enum representing different caching patterns that can be used in the application.

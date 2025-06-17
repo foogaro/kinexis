@@ -1,23 +1,19 @@
 package com.foogaro.redis.demo.entity;
 
 import com.foogaro.kinexis.core.annotation.CachingPatterns;
-import com.foogaro.kinexis.core.service.CachingPattern;
-import com.redis.om.spring.annotations.Document;
+import com.foogaro.kinexis.core.model.CachingFormat;
+import com.foogaro.kinexis.core.model.CachingPattern;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
-import org.springframework.data.redis.core.RedisHash;
 
-@RedisHash("employer")
 @Entity
 @Table(name = "employers")
-@CachingPatterns(patterns = {CachingPattern.WRITE_BEHIND, CachingPattern.CACHE_ASIDE, CachingPattern.REFRESH_AHEAD})
-@Document
+@CachingPatterns(format = CachingFormat.JSON, patterns = {CachingPattern.WRITE_BEHIND, CachingPattern.CACHE_ASIDE, CachingPattern.REFRESH_AHEAD})
 public class Employer {
 
     @Id
-//    @GeneratedValue(strategy = GenerationType.IDENTITY)  // Auto-increment primary key
     private Long id;
 
     @Column(name = "name", nullable = false)
