@@ -1,10 +1,13 @@
-[![Maven Central](https://img.shields.io/maven-central/v/io.github.foogaro/kinexis.svg)](https://search.maven.org/artifact/io.github.foogaro/kinexis)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.foogaro/kinexis-core.svg)](https://search.maven.org/artifact/io.github.foogaro/kinexis-core)
 
 # Kinexis
 
 Kinexis. Implementing The Caching Patterns The Right Way. Write Once. Reflect Instantly. Rediscover Effortlessly.
 
 ## Introduction
+
+The name **Kinexis** is a coined term, created by merging the words **Kinesis** (movement, flow) and **Nexus** (connection, link).
+It reflects the library’s core purpose: managing the **flow of data** between systems through **connected, reliable caching patterns**.
 
 The Kinexis library offers a powerful and efficient implementation of the most common used caching pattern, specifically designed to support high-performance applications that require rapid data access and consistency across cache and database layers. By handling cache updates and synchronizing them with the underlying database in the background, this library ensures that data remains current and consistent without compromising application speed or responsiveness. This streamlined approach simplifies data management, making it ideal for applications with demanding performance and scalability requirements.
 
@@ -75,7 +78,6 @@ Not all caching systems provide built-in mechanisms to connect directly to a dat
 
 However, **RedisGears was deprecated** because it relied on Redis's **Pub/Sub notification system**, which does not guarantee message delivery. This meant that, under certain conditions, a write operation could be triggered in Redis but **never reach the database**, leading to **silent inconsistencies** without any built-in detection or recovery.
 
-(term coined by merging the words Kinesys and Nexus)
 **Kinexis**is a lightweight yet powerful library that enables developers to implement widely used caching patterns directly at the application level, without relying on custom modules or specialized infrastructure within the caching system. With **just a few lines of code**, Kinexis makes it easy to apply caching strategies in a consistent, reliable, and maintainable way across different parts of an application.
 
 Kinexis is built on top of **Redis** and integrates seamlessly with the Java ecosystem, leveraging popular clients such as **Lettuce**, **Jedis**, and **Spring Data Redis**. This allows developers to adopt Kinexis within existing projects with minimal friction, while taking advantage of the flexibility and performance of Redis as the underlying cache.
