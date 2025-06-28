@@ -121,32 +121,29 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
                 String packageName = elementUtils.getPackageOf(entityElement).getQualifiedName().toString() + "." + className.toLowerCase();
                 // Finds all repos managing the entity
                 Set<TypeElement> repositories = findRepositoriesForEntity(roundEnv, entityElement);
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating RedisRepository(s), StreamListener(s), Processors(s), ProcessOrchestrator(s) and PendingMessageHandler(s)");
                 for (TypeElement repository : repositories) {
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating RedisRepository(s), StreamListener(s), Processors(s), ProcessOrchestrator(s) and PendingMessageHandler(s)");
-                    String newRedisRepository = generateRedisRepository(packageName, className, entityElement);
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tRedisRepository for: " + entityElement);
-                    assert newRedisRepository != null;
-
                     generateStreamListener(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    generateStreamListener(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
                     processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tStreamListener for: " + repository);
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tStreamListener for: " + newRedisRepository);
-
                     generateProcessor(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    generateProcessor(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
                     processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessor for: " + repository);
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessor for: " + newRedisRepository);
-
                     generateProcessOrchestrator(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    generateProcessOrchestrator(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
                     processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessOrchestrator for: " + repository);
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessOrchestrator for: " + newRedisRepository);
-
                     generatePendingMessageHandler(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    generatePendingMessageHandler(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
                     processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tPendingMessageHandler for: " + repository);
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tPendingMessageHandler for: " + newRedisRepository);
                 }
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating RedisRepository, RedisStreamListener, RedisProcessors, RedisProcessOrchestrator and RedisPendingMessageHandler");
+                String newRedisRepository = generateRedisRepository(packageName, className, entityElement);
+                assert newRedisRepository != null;
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tRedisRepository for: " + entityElement);
+                generateStreamListener(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tStreamListener for: " + newRedisRepository);
+                generateProcessor(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessor for: " + newRedisRepository);
+                generateProcessOrchestrator(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessOrchestrator for: " + newRedisRepository);
+                generatePendingMessageHandler(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tPendingMessageHandler for: " + newRedisRepository);
 
                 processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating KeyExpirationListener(s)");
                 Arrays.stream(element.getAnnotation(CachingPatterns.class).patterns())
