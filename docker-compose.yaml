@@ -59,6 +59,43 @@ services:
     networks:
       demo:
         ipv4_address: 172.32.0.4
+
+  mongo:
+    image: mongo:8.0.10-noble
+    container_name: mongodb
+    hostname: mongodb
+#    volumes:
+#      - ./mongodb/initdb.d/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+#      - mongodb-data:/data/db/
+#      - mongodb-log:/var/log/mongodb/
+#    env_file:
+#      - .env
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: 'admin'
+      MONGO_INITDB_ROOT_PASSWORD: 'admin'
+    ports:
+      - "27017:27017"
+    networks:
+      demo:
+        ipv4_address: 172.32.0.5
+
+  mongo-express:
+    image: mongo-express:1.0.2-20-alpine3.19
+    container_name: mongo-express
+    restart: always
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: 'admin'
+      ME_CONFIG_MONGODB_ADMINPASSWORD: 'admin'
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_MONGODB_SERVER: 'mongodb'
+      ME_CONFIG_BASICAUTH_USERNAME: 'admin'
+      ME_CONFIG_BASICAUTH_PASSWORD: 'admin'
+    ports:
+      - 8081:8081
+    networks:
+      demo:
+        ipv4_address: 172.32.0.6
+
 networks:
   demo:
     driver: bridge

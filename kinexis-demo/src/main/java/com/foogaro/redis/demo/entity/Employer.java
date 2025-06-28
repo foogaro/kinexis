@@ -7,9 +7,11 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import org.springframework.data.mongodb.core.mapping.Document;
 
 @Entity
 @Table(name = "employers")
+@Document(collection = "employers")
 @CachingPatterns(format = CachingFormat.JSON, patterns = {CachingPattern.WRITE_BEHIND, CachingPattern.CACHE_ASIDE, CachingPattern.REFRESH_AHEAD})
 public class Employer {
 

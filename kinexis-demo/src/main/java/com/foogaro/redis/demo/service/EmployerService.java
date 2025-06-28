@@ -2,7 +2,7 @@ package com.foogaro.redis.demo.service;
 
 import com.foogaro.kinexis.core.service.KinexisService;
 import com.foogaro.redis.demo.entity.Employer;
-import com.foogaro.redis.demo.repository.EmployerRepository;
+import com.foogaro.redis.demo.repository.mysql.EmployerMysqlRepository;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -10,9 +10,9 @@ import java.util.List;
 @Service
 public class EmployerService extends KinexisService<Employer> {
 
-    private final EmployerRepository repository;
+    private final EmployerMysqlRepository repository;
 
-    public EmployerService(EmployerRepository repository) {
+    public EmployerService(EmployerMysqlRepository repository) {
         this.repository = repository;
     }
 
