@@ -2,26 +2,20 @@ package com.foogaro.kinexis.core.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.foogaro.kinexis.core.Misc;
+import com.foogaro.kinexis.core.model.KinexisEvent;
+import com.foogaro.kinexis.core.store.CacheStore;
+import com.foogaro.kinexis.core.store.EntityStoreRegistry;
+import com.foogaro.kinexis.core.stream.EventPublisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.keyvalue.repository.KeyValueRepository;
-import org.springframework.data.redis.connection.stream.MapRecord;
-import org.springframework.data.redis.connection.stream.RecordId;
-import org.springframework.data.redis.connection.stream.StreamRecords;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.repository.CrudRepository;
-import org.springframework.data.repository.Repository;
 
 import java.lang.reflect.ParameterizedType;
-import java.util.HashMap;
-import java.util.Map;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-
-import static com.foogaro.kinexis.core.Misc.EVENT_CONTENT_KEY;
-import static com.foogaro.kinexis.core.Misc.EVENT_OPERATION_KEY;
 
 /**
  * Abstract base class for Kinexis services that handle entity operations with Redis caching.
@@ -38,15 +32,14 @@ public abstract class KinexisService<T> {
     private final Class<T> entityClass;
 
     @Autowired
-    private RedisTemplate<String, String> redisTemplate;
-
-    @Autowired
     private ObjectMapper objectMapper;
 
     @Autowired
-    private BeanFinder beanFinder;
-    @Autowired
     private AnnotationFinder annotationFinder;
+    @Autowired
+    private EntityStoreRegistry entityStoreRegistry;
+    @Autowired
+    private EventPublisher eventPublisher;
 
     /**
      * No-args constructor for KinexisService.
@@ -55,10 +48,11 @@ public abstract class KinexisService<T> {
     @SuppressWarnings("unchecked")
     public KinexisService() {
         this.entityClass = (Class<T>) ((ParameterizedType) getClass().getGenericSuperclass()).getActualTypeArguments()[0];
-        this.streamKey = Misc.getStreamKey(entityClass);
     }
 
-    private final String streamKey;
+    public Class<T> getEntityClass() {
+        return entityClass;
+    }
 
     /**
      * Saves an entity to the cache or initiates a write-behind operation.
@@ -68,9 +62,16 @@ public abstract class KinexisService<T> {
      * @param entity the entity to save
      */
     public void save(T entity) {
+        save(entity, new String[0]);
+    }
+
+    public void save(T entity, String... targets) {
         if (Objects.nonNull(entity)) {
-            if (annotationFinder.hasWriteBehind(entityClass)) {
-                writeBehindForInsert(entity);
+            if (!annotationFinder.isEnabled(entityClass)) {
+                writeToDatabase(entity);
+                logger.debug("Kinexis disabled for Entity {}", entityClass.getSimpleName());
+            } else if (annotationFinder.hasWriteBehind(entityClass)) {
+                writeBehindForInsert(entity, targets);
             } else {
                 writeToCache(entity);
                 logger.debug("Pattern WriteBehind not enabled for Entity {}", entityClass.getSimpleName());
@@ -90,18 +91,6 @@ public abstract class KinexisService<T> {
     }
 
     /**
-     * Reloads an entity from the database and updates the cache.
-     * This method implements the Cache-Aside pattern by reading from the database
-     * and then updating the cache with the fresh data.
-     *
-     * @param id the identifier of the entity to reload
-     * @return an Optional containing the reloaded entity if found
-     */
-//    public Optional<T> reloadById(Object id) {
-//        return cacheAside(id);
-//    }
-
-    /**
      * Finds an entity by its identifier.
      * This method implements a combination of Cache-Aside and Refresh-Ahead patterns:
      * 1. First attempts to read from cache
@@ -114,6 +103,10 @@ public abstract class KinexisService<T> {
     public Optional<T> findById(Object id) {
         Optional<T> entity = Optional.empty();
         if (Objects.nonNull(id)) {
+            if (!annotationFinder.isEnabled(entityClass)) {
+                logger.debug("Kinexis disabled for Entity {}", entityClass.getSimpleName());
+                return readFromDatabase(id);
+            }
             entity = readFromCache(id);
             if (entity.isPresent()) {
                 return entity;
@@ -137,9 +130,16 @@ public abstract class KinexisService<T> {
      * @param id the identifier of the entity to delete
      */
     public void delete(Object id) {
+        delete(id, new String[0]);
+    }
+
+    public void delete(Object id, String... targets) {
         if (Objects.nonNull(id)) {
-            if (annotationFinder.hasWriteBehind(entityClass)) {
-                writeBehindForDelete(id);
+            if (!annotationFinder.isEnabled(entityClass)) {
+                deleteFromDatabase(id);
+                logger.debug("Kinexis disabled for Entity {}", entityClass.getSimpleName());
+            } else if (annotationFinder.hasWriteBehind(entityClass)) {
+                writeBehindForDelete(id, targets);
                 logger.debug("Deleted by Id: {}", id);
             } else {
                 deleteFromCache(id);
@@ -149,38 +149,39 @@ public abstract class KinexisService<T> {
     }
 
 
-    private String writeBehindForInsert(T entity) {
+    private String writeBehindForInsert(T entity, String... targets) {
         try {
+            validateWriteBehindTargets(targets);
             String json = objectMapper.writeValueAsString(entity);
-            Map<String, String> map = new HashMap<>();
-            map.put(EVENT_CONTENT_KEY, json);
-            MapRecord<String, String, String> record = StreamRecords.newRecord()
-                    .withId(RecordId.autoGenerate())
-                    .ofMap(map)
-                    .withStreamKey(streamKey);
-            String recordId = save(record);
-            logger.debug("RecordId {} added for ingestion to the Stream {}", recordId, streamKey);
+            String recordId = eventPublisher.append(entityClass, KinexisEvent.save(entityClass, json, targets));
+            logger.debug("RecordId {} added for ingestion to the Stream for entity {}", recordId, entityClass.getSimpleName());
             return recordId;
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
     }
 
-    private String save(MapRecord<String, String, String> mapRecord) {
-        RecordId recordId = redisTemplate.opsForStream().add(mapRecord);
-        return Objects.nonNull(recordId) ? recordId.getValue() : null;
+    private void writeBehindForDelete(Object id, String... targets) {
+        validateWriteBehindTargets(targets);
+        String recordId = eventPublisher.append(entityClass, KinexisEvent.delete(entityClass, id, targets));
+        logger.debug("RecordId {} added for deletion to the Stream for entity {}", Objects.nonNull(recordId) ? recordId : "<null>", entityClass.getSimpleName());
     }
 
-    private void writeBehindForDelete(Object id) {
-        Map<String, String> map = new HashMap<>();
-        map.put(EVENT_CONTENT_KEY, id.toString());
-        map.put(EVENT_OPERATION_KEY, Misc.Operation.DELETE.getValue());
-        MapRecord<String, String, String> record = StreamRecords.newRecord()
-                .withId(RecordId.autoGenerate())
-                .ofMap(map)
-                .withStreamKey(streamKey);
-        RecordId recordId = redisTemplate.opsForStream().add(record);
-        logger.debug("RecordId {} added for deletion to the Stream {}", Objects.nonNull(recordId) ? recordId.getValue() : "<null>", streamKey);
+    private void validateWriteBehindTargets(String... targets) {
+        List<String> selectedTargets = Arrays.stream(targets == null ? new String[0] : targets)
+                .filter(Objects::nonNull)
+                .filter(target -> !target.isBlank())
+                .toList();
+        if (selectedTargets.isEmpty()) {
+            if (entityStoreRegistry.findTargetStores(entityClass).isEmpty()) {
+                throw new IllegalStateException("No target EntityStore configured for entity " + entityClass.getName());
+            }
+            return;
+        }
+        if (entityStoreRegistry.findTargetStores(entityClass, selectedTargets).isEmpty()) {
+            throw new IllegalArgumentException("No target EntityStore configured for entity "
+                    + entityClass.getName() + " and targets " + selectedTargets);
+        }
     }
 
     private Optional<T> cacheAside(Object id) {
@@ -199,32 +200,17 @@ public abstract class KinexisService<T> {
     }
 
     private Optional<T> readFromCache(Object id) {
-        Optional<T> entity = Optional.empty();
-        String repositoryName = entityClass.getSimpleName() + "RedisRepository";
-        Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
-        if (repository instanceof KeyValueRepository) {
-            @SuppressWarnings("unchecked")
-            KeyValueRepository<T, Object> keyValueRepository = (KeyValueRepository<T, Object>) repository;
-            entity = keyValueRepository.findById(id);
-            logger.debug("Entity read from cache: {}", entity);
-        } else {
-            logger.warn("Repository is not a KeyValueRepository: {}", repository.getClass().getSimpleName());
-        }
+        Optional<T> entity = entityStoreRegistry.findCacheStore(entityClass)
+                .flatMap(store -> store.findById(id));
+        entity.ifPresent(value -> logger.debug("Entity read from cache: {}", value));
         return entity;
     }
 
     private void deleteFromCache(Object id) {
         if (Objects.nonNull(id)) {
-            String repositoryName = entityClass.getSimpleName() + "RedisRepository";
-            Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
-            if (repository instanceof KeyValueRepository) {
-                @SuppressWarnings("unchecked")
-                KeyValueRepository<T, Object> keyValueRepository = (KeyValueRepository<T, Object>) repository;
-                keyValueRepository.deleteById(id);
-                logger.debug("Entity deleted from cache: {}", id);
-            } else {
-                logger.warn("Repository is not a KeyValueRepository: {}", repository.getClass().getSimpleName());
-            }
+            Optional<CacheStore<T>> cacheStore = entityStoreRegistry.findCacheStore(entityClass);
+            cacheStore.ifPresent(store -> store.deleteById(id));
+            cacheStore.ifPresent(store -> logger.debug("Entity deleted from cache: {}", id));
         } else {
             logger.warn("Id is null for entity {}", entityClass.getSimpleName());
         }
@@ -232,17 +218,11 @@ public abstract class KinexisService<T> {
 
     private Optional<T> writeToCache(T entity) {
         if (Objects.nonNull(entity)) {
-            String repositoryName = entityClass.getSimpleName() + "RedisRepository";
-            Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
-            if (repository instanceof KeyValueRepository) {
-                @SuppressWarnings("unchecked")
-                KeyValueRepository<T, Object> keyValueRepository = (KeyValueRepository<T, Object>) repository;
-                T savedEntity = keyValueRepository.save(entity);
-                logger.debug("Entity written to cache: {}", savedEntity);
-                return Optional.of(savedEntity);
-            } else {
-                logger.warn("Repository is not a KeyValueRepository: {}", repository.getClass().getSimpleName());
-            }
+            Duration ttl = cacheTtl();
+            Optional<T> savedEntity = entityStoreRegistry.findCacheStore(entityClass)
+                    .map(store -> ttl.isZero() ? store.save(entity) : store.save(entity, ttl));
+            savedEntity.ifPresent(value -> logger.debug("Entity written to cache: {}", value));
+            return savedEntity;
         } else {
             logger.warn("Entity is null: {}", entity);
         }
@@ -250,32 +230,17 @@ public abstract class KinexisService<T> {
     }
 
     private Optional<T> readFromDatabase(Object id) {
-        Optional<T> entity = Optional.empty();
-        String repositoryName = entityClass.getSimpleName() + "Repository";
-        Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
-        if (repository instanceof CrudRepository) {
-            @SuppressWarnings("unchecked")
-            CrudRepository<T, Object> crudRepository = (CrudRepository<T, Object>) repository;
-            entity = crudRepository.findById(id);
-            logger.debug("Entity read from database: {}", entity);
-        } else {
-            logger.warn("Repository is not a CrudRepository: {}", repository.getClass().getSimpleName());
-        }
+        Optional<T> entity = entityStoreRegistry.findPrimaryStore(entityClass)
+                .flatMap(store -> store.findById(id));
+        entity.ifPresent(value -> logger.debug("Entity read from database: {}", value));
         return entity;
     }
 
     private void deleteFromDatabase(Object id) {
         if (Objects.nonNull(id)) {
-            String repositoryName = entityClass.getSimpleName() + "Repository";
-            Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
-            if (repository instanceof CrudRepository) {
-                @SuppressWarnings("unchecked")
-                CrudRepository<T, Object> crudRepository = (CrudRepository<T, Object>) repository;
-                crudRepository.deleteById(id);
-                logger.debug("Entity deleted from database: {}", id);
-            } else {
-                logger.warn("Repository is not a CrudRepository: {}", repository.getClass().getSimpleName());
-            }
+            entityStoreRegistry.findPrimaryStore(entityClass)
+                    .ifPresent(store -> store.deleteById(id));
+            logger.debug("Entity deleted from database: {}", id);
         } else {
             logger.warn("Id is null for entity {}", entityClass.getSimpleName());
         }
@@ -283,21 +248,19 @@ public abstract class KinexisService<T> {
 
     private Optional<T> writeToDatabase(T entity) {
         if (Objects.nonNull(entity)) {
-            String repositoryName = entityClass.getSimpleName() + "Repository";
-            Repository<Object, ?> repository = beanFinder.findRepositoriesForEntity(repositoryName).getFirst();
-            if (repository instanceof CrudRepository) {
-                @SuppressWarnings("unchecked")
-                CrudRepository<T, Object> crudRepository = (CrudRepository<T, Object>) repository;
-                T savedEntity = crudRepository.save(entity);
-                logger.debug("Entity written to database: {}", savedEntity);
-                return Optional.of(savedEntity);
-            } else {
-                logger.warn("Repository is not a CrudRepository: {}", repository.getClass().getSimpleName());
-            }
+            Optional<T> savedEntity = entityStoreRegistry.findPrimaryStore(entityClass)
+                    .map(store -> store.save(entity));
+            savedEntity.ifPresent(value -> logger.debug("Entity written to database: {}", value));
+            return savedEntity;
         } else {
             logger.warn("Entity is null: {}", entity);
         }
         return Optional.empty();
+    }
+
+    private Duration cacheTtl() {
+        long ttl = annotationFinder.ttl(entityClass);
+        return ttl > 0 ? Duration.ofSeconds(ttl) : Duration.ZERO;
     }
 
 }

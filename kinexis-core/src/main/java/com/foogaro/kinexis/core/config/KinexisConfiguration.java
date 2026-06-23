@@ -4,6 +4,20 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.foogaro.kinexis.core.service.AnnotationFinder;
 import com.foogaro.kinexis.core.service.BeanFinder;
+import com.foogaro.kinexis.core.service.KinexisDlqService;
+import com.foogaro.kinexis.core.service.KinexisDiagnosticsService;
+import com.foogaro.kinexis.core.service.KinexisEntityRegistry;
+import com.foogaro.kinexis.core.service.KinexisService;
+import com.foogaro.kinexis.core.service.KinexisStoreValidator;
+import com.foogaro.kinexis.core.processor.Processor;
+import com.foogaro.kinexis.core.store.BeanFinderEntityStoreRegistry;
+import com.foogaro.kinexis.core.store.DefaultEntityStoreRegistry;
+import com.foogaro.kinexis.core.store.EmptyEntityStoreRegistry;
+import com.foogaro.kinexis.core.store.EntityStore;
+import com.foogaro.kinexis.core.store.EntityStoreRegistry;
+import com.foogaro.kinexis.core.stream.EventPublisher;
+import com.foogaro.kinexis.core.stream.KinexisStreamLifecycle;
+import com.foogaro.kinexis.core.stream.RedisStreamEventPublisher;
 import io.lettuce.core.ClientOptions;
 import io.lettuce.core.SocketOptions;
 import io.lettuce.core.resource.ClientResources;
@@ -12,13 +26,16 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ListableBeanFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
-import org.springframework.data.redis.connection.jedis.JedisConnectionFactory;
 import org.springframework.data.redis.connection.lettuce.LettuceClientConfiguration;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.connection.stream.MapRecord;
@@ -29,9 +46,11 @@ import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSeriali
 import org.springframework.data.redis.serializer.GenericToStringSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.data.redis.stream.StreamMessageListenerContainer;
-import redis.clients.jedis.Jedis;
 
 import java.time.Duration;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Spring configuration class that provides beans for Redis connection, message handling,
@@ -46,6 +65,7 @@ import java.time.Duration;
  * </ul>
  */
 @Configuration
+@EnableConfigurationProperties(KinexisProperties.class)
 public class KinexisConfiguration {
 
     private final Logger logger = LoggerFactory.getLogger(getClass());
@@ -61,29 +81,6 @@ public class KinexisConfiguration {
     }
 
     @Bean
-    public Jedis jedis() {
-        return new Jedis(redis_host, redis_port);
-    }
-
-    /**
-     * Creates a Jedis connection factory for Redis if one doesn't already exist.
-     * The factory is configured using the host and port from application properties.
-     *
-     * @return a configured JedisConnectionFactory instance
-     */
-    @Bean
-    @ConditionalOnMissingBean(JedisConnectionFactory.class)
-    public JedisConnectionFactory jedisConnectionFactory() {
-        logger.debug("Creating JedisConnectionFactory");
-        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration();
-        config.setHostName(redis_host);
-        config.setPort(redis_port);
-        logger.debug("Created JedisConnectionFactory");
-        return new JedisConnectionFactory(config);
-    }
-
-    @Bean
-//    @ConditionalOnMissingBean(LettuceConnectionFactory.class)
     public ClientResources clientResources() {
         return DefaultClientResources.builder()
                 .ioThreadPoolSize(4)
@@ -92,7 +89,6 @@ public class KinexisConfiguration {
     }
 
     @Bean
-//    @ConditionalOnMissingBean(LettuceConnectionFactory.class)
     public ClientOptions clientOptions() {
         return ClientOptions.builder()
                 .socketOptions(SocketOptions.builder()
@@ -106,7 +102,6 @@ public class KinexisConfiguration {
 
     @Bean
     @Primary
-//    @ConditionalOnMissingBean(LettuceConnectionFactory.class)
     public LettuceConnectionFactory lettuceConnectionFactory(ClientResources clientResources, ClientOptions clientOptions) {
         LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
                 .clientResources(clientResources)
@@ -128,7 +123,6 @@ public class KinexisConfiguration {
      * @return a configured RedisTemplate instance
      */
     @Bean
-//    @ConditionalOnMissingBean
     public RedisTemplate<String, String> redisTemplate(LettuceConnectionFactory connectionFactory) {
         logger.debug("Creating RedisTemplate");
         RedisTemplate<String, String> template = new RedisTemplate<>();
@@ -185,6 +179,74 @@ public class KinexisConfiguration {
         return new AnnotationFinder();
     }
 
+    @Bean
+    @ConditionalOnMissingBean
+    @SuppressWarnings("deprecation")
+    public EntityStoreRegistry entityStoreRegistry(BeanFinder beanFinder, ObjectProvider<EntityStore<?>> entityStores,
+                                                   RedisTemplate<String, String> redisTemplate,
+                                                   KinexisProperties properties) {
+        EntityStoreRegistry fallbackRegistry = properties.getStores().getRepositoryDiscovery().isEnabled()
+                ? new BeanFinderEntityStoreRegistry(beanFinder, redisTemplate)
+                : new EmptyEntityStoreRegistry();
+        return new DefaultEntityStoreRegistry(entityStores.orderedStream().toList(), fallbackRegistry);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public EventPublisher eventPublisher(RedisTemplate<String, String> redisTemplate) {
+        return new RedisStreamEventPublisher(redisTemplate);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public KinexisDlqService kinexisDlqService(RedisTemplate<String, String> redisTemplate) {
+        return new KinexisDlqService(redisTemplate);
+    }
+
+    @Bean(destroyMethod = "shutdown")
+    @ConditionalOnMissingBean(name = "kinexisStoreExecutor")
+    public ExecutorService kinexisStoreExecutor(KinexisProperties properties) {
+        int parallelism = Math.max(1, properties.getProcessing().getMaxParallelStores());
+        AtomicInteger threadCount = new AtomicInteger();
+        return Executors.newFixedThreadPool(parallelism, task -> {
+            Thread thread = new Thread(task, "kinexis-store-" + threadCount.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public KinexisDiagnosticsService kinexisDiagnosticsService(ObjectProvider<EntityStore<?>> entityStores,
+                                                               ObjectProvider<Processor<?>> processors,
+                                                               ObjectProvider<KinexisService<?>> services,
+                                                               ObjectProvider<KinexisEntityRegistry> entityRegistries,
+                                                               EntityStoreRegistry entityStoreRegistry,
+                                                               AnnotationFinder annotationFinder) {
+        return new KinexisDiagnosticsService(
+                entityStores.orderedStream().toList(),
+                processors.orderedStream().toList(),
+                services.orderedStream().toList(),
+                entityRegistries.orderedStream().toList(),
+                entityStoreRegistry,
+                annotationFinder);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public KinexisStoreValidator kinexisStoreValidator(KinexisDiagnosticsService diagnosticsService,
+                                                       KinexisProperties properties) {
+        return new KinexisStoreValidator(diagnosticsService, properties);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public KinexisStreamLifecycle kinexisStreamLifecycle(
+            RedisTemplate<String, String> redisTemplate,
+            StreamMessageListenerContainer<String, MapRecord<String, String, String>> streamMessageListenerContainer) {
+        return new KinexisStreamLifecycle(redisTemplate, streamMessageListenerContainer);
+    }
+
     /**
      * Creates a StreamMessageListenerContainer for handling Redis Stream messages.
      * The container is configured with a poll timeout and batch size for message processing.
@@ -194,13 +256,13 @@ public class KinexisConfiguration {
      */
     @Bean
     public StreamMessageListenerContainer<String, MapRecord<String, String, String>> streamMessageListenerContainer(
-            LettuceConnectionFactory connectionFactory) {
+            LettuceConnectionFactory connectionFactory, KinexisProperties properties) {
         logger.debug("Creating StreamMessageListenerContainer");
         StreamMessageListenerContainer.StreamMessageListenerContainerOptions<String, MapRecord<String, String, String>> options =
                 StreamMessageListenerContainer.StreamMessageListenerContainerOptions
                         .builder()
-                        .pollTimeout(Duration.ofMillis(1000))
-                        .batchSize(100)
+                        .pollTimeout(properties.getStream().getPollTimeout())
+                        .batchSize(properties.getStream().getBatchSize())
                         .build();
         StreamMessageListenerContainer<String, MapRecord<String, String, String>> streamMessageListenerContainer = StreamMessageListenerContainer.create(connectionFactory, options);
         logger.debug("Created StreamMessageListenerContainer: {}", streamMessageListenerContainer);
@@ -211,16 +273,17 @@ public class KinexisConfiguration {
      * Configures Redis key expiration events.
      * This bean enables the 'Ex' notification type for key expiration events.
      *
-     * @param jedis the Jedis client instance
      * @return an anonymous object that configures Redis on initialization
      */
     @Bean
-    public Object configureRedisKeyExpirationEvents(Jedis jedis) {
+    public Object configureRedisKeyExpirationEvents(RedisConnectionFactory redisConnectionFactory) {
         return new Object() {
             @PostConstruct
             public void init() {
-                String result = jedis.configSet("notify-keyspace-events", "Ex");
-                logger.debug("Redis key expiration events configuration result: " + result);
+                try (RedisConnection connection = redisConnectionFactory.getConnection()) {
+                    connection.serverCommands().setConfig("notify-keyspace-events", "Ex");
+                    logger.debug("Redis key expiration events configured");
+                }
             }
         };
     }

@@ -7,6 +7,9 @@ import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.core.RedisHash;
 
 import java.lang.annotation.Annotation;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Optional;
 
 /**
  * Utility class providing common functionality for Redis operations and message handling.
@@ -71,6 +74,62 @@ public class Misc {
         return entityClass.getSimpleName().toLowerCase();
     }
 
+    public static Optional<Object> getEntityId(final Object entity) {
+        if (entity == null) {
+            return Optional.empty();
+        }
+        Class<?> entityClass = entity.getClass();
+        for (Field field : entityClass.getDeclaredFields()) {
+            if (isIdField(field)) {
+                return getFieldValue(entity, field);
+            }
+        }
+        try {
+            Field field = entityClass.getDeclaredField("id");
+            return getFieldValue(entity, field);
+        } catch (NoSuchFieldException ignored) {
+            return getIdFromMethod(entity);
+        }
+    }
+
+    public static Optional<String> getEntityKey(final Object entity) {
+        return getEntityId(entity)
+                .map(id -> getEntityKeyPrefix(entity.getClass()) + KEY_SEPARATOR + id);
+    }
+
+    private static boolean isIdField(Field field) {
+        return java.util.Arrays.stream(field.getAnnotations())
+                .map(annotation -> annotation.annotationType().getName())
+                .anyMatch(name -> name.equals("jakarta.persistence.Id")
+                        || name.equals("javax.persistence.Id")
+                        || name.equals("org.springframework.data.annotation.Id"));
+    }
+
+    private static Optional<Object> getFieldValue(Object entity, Field field) {
+        try {
+            field.setAccessible(true);
+            return Optional.ofNullable(field.get(entity));
+        } catch (IllegalAccessException e) {
+            logger.debug("Could not read id field {} from {}", field.getName(), entity.getClass().getName(), e);
+            return Optional.empty();
+        }
+    }
+
+    private static Optional<Object> getIdFromMethod(Object entity) {
+        try {
+            Method method = entity.getClass().getMethod("getId");
+            return Optional.ofNullable(method.invoke(entity));
+        } catch (ReflectiveOperationException ignored) {
+            try {
+                Method method = entity.getClass().getMethod("id");
+                return Optional.ofNullable(method.invoke(entity));
+            } catch (ReflectiveOperationException e) {
+                logger.debug("Could not resolve id for {}", entity.getClass().getName());
+                return Optional.empty();
+            }
+        }
+    }
+
     /**
      * Generates a Redis Stream key for an entity class.
      *
@@ -92,22 +151,47 @@ public class Misc {
     }
 
     /**
-     * Generates a consumer group name for a repository class.
+     * Generates a consumer group name for an entity class.
      *
-     * @param repositoryClass the repository class to generate the consumer group name for
+     * @param entityClass the entity class to generate the consumer group name for
      * @return the consumer group name
      */
-    public static String getConsumerGroup(final Class<?> repositoryClass) {
+    public static String getConsumerGroup(final Class<?> entityClass) {
+        return entityClass.getSimpleName().toLowerCase() + CONSUMER_GROUP_SUFFIX;
+    }
+
+    /**
+     * Generates a consumer name for an entity class.
+     *
+     * @param entityClass the entity class
+     * @return the consumer name
+     */
+    public static String getConsumerName(final Class<?> entityClass) {
+        return entityClass.getSimpleName().toLowerCase() + CONSUMER_SUFFIX;
+    }
+
+    /**
+     * Generates a consumer group name using the legacy repository-specific shape.
+     *
+     * @param entityClass the entity class
+     * @param repositoryClass the repository class
+     * @return the consumer group name
+     * @deprecated entity-level consumers should use {@link #getConsumerGroup(Class)}
+     */
+    @Deprecated(forRemoval = false)
+    public static String getConsumerGroup(final Class<?> entityClass, final Class<?> repositoryClass) {
         return repositoryClass.getSimpleName().toLowerCase() + CONSUMER_GROUP_SUFFIX;
     }
 
     /**
-     * Generates a consumer name combining entity and repository class names.
+     * Generates a consumer name using the legacy repository-specific shape.
      *
      * @param entityClass the entity class
      * @param repositoryClass the repository class
      * @return the consumer name
+     * @deprecated entity-level consumers should use {@link #getConsumerName(Class)}
      */
+    @Deprecated(forRemoval = false)
     public static String getConsumerName(final Class<?> entityClass, final Class<?> repositoryClass) {
         return entityClass.getSimpleName().toLowerCase() + VALUE_SEPARATOR + repositoryClass.getSimpleName().toLowerCase() + CONSUMER_SUFFIX;
     }
@@ -134,12 +218,8 @@ public class Misc {
      * These operations are used in Redis Stream messages to indicate the type of action.
      */
     public enum Operation {
-        /** Create operation */
-        CREATE("CREATE"),
-        /** Read operation */
-        READ("READ"),
-        /** Update operation */
-        UPDATE("UPDATE"),
+        /** Save operation */
+        SAVE("SAVE"),
         /** Delete operation */
         DELETE("DELETE");
 
@@ -161,22 +241,6 @@ public class Misc {
          */
         public String getValue() {
             return value;
-        }
-
-        /**
-         * Converts a string to an Operation enum value.
-         *
-         * @param text the string to convert
-         * @return the corresponding Operation enum value
-         * @throws IllegalArgumentException if no matching operation is found
-         */
-        public static Operation fromString(final String text) {
-            for (Operation operation : Operation.values()) {
-                if (operation.value.equalsIgnoreCase(text)) {
-                    return operation;
-                }
-            }
-            throw new IllegalArgumentException("No constant with text " + text + " found");
         }
 
         @Override

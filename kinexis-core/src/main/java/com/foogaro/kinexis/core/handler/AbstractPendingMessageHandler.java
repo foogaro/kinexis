@@ -1,12 +1,12 @@
 package com.foogaro.kinexis.core.handler;
 
+import com.foogaro.kinexis.core.config.KinexisProperties;
 import com.foogaro.kinexis.core.exception.AcknowledgeMessageException;
 import com.foogaro.kinexis.core.exception.ProcessMessageException;
 import com.foogaro.kinexis.core.processor.Processor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -14,6 +14,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 
 import java.lang.reflect.ParameterizedType;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -26,30 +27,38 @@ import static com.foogaro.kinexis.core.Misc.*;
  * handling for failed messages.
  *
  * @param <T> the type of entity that this handler processes
- * @param <R> the type of repository used for entity operations
  */
-public abstract class AbstractPendingMessageHandler<T, R> implements MessageHandler<T, R> {
+public abstract class AbstractPendingMessageHandler<T> {
+
+    public static final String DLQ_REASON_KEY = "reason";
+    public static final String DLQ_ERROR_KEY = "error";
+    public static final String DLQ_STREAM_KEY = "streamKey";
+    public static final String DLQ_STREAM_ID_KEY = "streamID";
+    public static final String DLQ_CONSUMER_KEY = "consumer";
+    public static final String DLQ_GROUP_KEY = "group";
+    public static final String DLQ_ATTEMPTS_KEY = "attempts";
+    public static final String DLQ_FAILED_STORE_KEY = "failedStore";
+    public static final String DLQ_EXCEPTION_CLASS_KEY = "exceptionClass";
+    public static final String DLQ_FAILURE_TIMESTAMP_KEY = "failureTimestamp";
 
     private Logger logger = LoggerFactory.getLogger(getClass());
 
-    /** Maximum number of processing attempts for a message */
-    @Value("${kinexis.stream.listener.pel.max-attempts:3}")
-    protected int MAX_ATTEMPTS;
-    /** Maximum retention time for message processing attempts in milliseconds */
-    @Value("${kinexis.stream.listener.pel.max-retention:120000}")
-    protected long MAX_RETENTION;
-    /** Number of messages to process in each batch */
-    @Value("${kinexis.stream.listener.pel.batch-size:50}")
-    protected int BATCH_SIZE;
-    /** Fixed delay between processing attempts in milliseconds */
-    @Value("${kinexis.stream.listener.pel.fixed-delay:300000}")
-    protected final long fixedDelay = 300000;
+    protected int MAX_ATTEMPTS = 3;
+    protected long MAX_RETENTION = 120000;
+    protected int BATCH_SIZE = 50;
 
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
 
     private final Class<T> entityClass;
-    private final Class<R> repositoryClass;
+
+    @Autowired
+    public void setKinexisProperties(KinexisProperties properties) {
+        KinexisProperties.Pending pending = properties.getStream().getListener().getPending();
+        MAX_ATTEMPTS = pending.getMaxAttempts();
+        MAX_RETENTION = pending.getMaxRetention();
+        BATCH_SIZE = pending.getBatchSize();
+    }
 
     /**
      * Gets the processor that handles the actual message processing logic.
@@ -57,11 +66,11 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
      *
      * @return the Processor instance that handles message processing
      */
-    public abstract Processor<T, R> getProcessor();
+    public abstract Processor<T> getProcessor();
 
     /**
-     * Constructs a new AbstractPendingMessageHandler and initializes the entity
-     * and repository classes using reflection to determine the generic type parameters.
+     * Constructs a new AbstractPendingMessageHandler and initializes the entity class
+     * using reflection to determine the generic type parameter.
      *
      * @throws ClassCastException if the generic type parameters cannot be determined
      */
@@ -69,16 +78,6 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
     public AbstractPendingMessageHandler() {
         super();
         this.entityClass = (Class<T>) ((ParameterizedType) getClass().getGenericSuperclass()).getActualTypeArguments()[0];
-        this.repositoryClass = (Class<R>) ((ParameterizedType) getClass().getGenericSuperclass()).getActualTypeArguments()[1];
-    }
-
-    /**
-     * Gets the Redis template used for Redis operations.
-     *
-     * @return the RedisTemplate instance
-     */
-    public RedisTemplate<String, String> getRedisTemplate() {
-        return redisTemplate;
     }
 
     /**
@@ -91,15 +90,6 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
     }
 
     /**
-     * Gets the repository class that manages the entity.
-     *
-     * @return the repository class
-     */
-    public Class<R> getRepositoryClass() {
-        return repositoryClass;
-    }
-
-    /**
      * Processes pending messages from the Redis Stream.
      * This scheduled method:
      * 1. Retrieves pending messages for the consumer group
@@ -107,11 +97,11 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
      * 3. Handles message failures by moving them to a dead letter queue
      * 4. Manages message acknowledgment and retry counters
      */
-    @Scheduled(fixedDelay = fixedDelay)
+    @Scheduled(fixedDelayString = "${kinexis.stream.listener.pending.fixed-delay:300000}")
     public void processPendingMessages() {
         String streamKey = getStreamKey(entityClass);
-        String groupName = getConsumerGroup(repositoryClass);
-        String consumerName = getConsumerName(entityClass, repositoryClass);
+        String groupName = getConsumerGroup(entityClass);
+        String consumerName = getConsumerName(entityClass);
 
         try {
             PendingMessagesSummary pendingSummary = redisTemplate.opsForStream()
@@ -156,12 +146,12 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
                             } catch (ProcessMessageException e) {
                                 logger.error("Error processing pending message: {} - {}", messageId, e.getMessage());
                                 if (counter >= MAX_ATTEMPTS) {
-                                    handleMessageFailure(message, "Too many attempts", new RuntimeException(e), getCounterKey(message.getId().getValue()));
+                                    handleMessageFailure(message, "Too many attempts", e, counter, getCounterKey(message.getId().getValue()));
                                     throw new RuntimeException(e);
                                 }
                             } catch (AcknowledgeMessageException e) {
                                 if (counter >= MAX_ATTEMPTS) {
-                                    handleMessageFailure(message, "Long lasting message", new RuntimeException(e), getCounterKey(message.getId().getValue()));
+                                    handleMessageFailure(message, "Long lasting message", e, counter, getCounterKey(message.getId().getValue()));
                                     throw new RuntimeException(e);
                                 }
                             }
@@ -207,8 +197,9 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
      */
     private void handleMessageFailure(MapRecord<String, String, String> message,
                                       String dlqReason, Exception cause,
+                                      long attempts,
                                       String counterKey) {
-        handleDLQ(message, dlqReason, cause);
+        handleDLQ(message, dlqReason, cause, attempts);
         expireCounterKey(counterKey);
     }
 
@@ -261,19 +252,25 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
      * @param dlqReason the reason for moving to dead letter queue
      * @param e the exception that caused the failure
      */
-    private void handleDLQ(MapRecord<String, String, String> message, String dlqReason, Exception e) {
+    private void handleDLQ(MapRecord<String, String, String> message, String dlqReason, Exception e, long attempts) {
         try {
             if (message != null) {
                 dumpMessage(message);
                 logger.error("Received error: {}", e.getMessage());
                 String deadLetterKey = getDLQStreamKey(entityClass);
                 Map<String, String> deadLetterMessage = new HashMap<>(message.getValue());
-                deadLetterMessage.put("reason", dlqReason);
-                deadLetterMessage.put("error", e.getMessage());
-                deadLetterMessage.put("streamKey", message.getStream());
-                deadLetterMessage.put("streamID", message.getId().getValue());
-                deadLetterMessage.put("consumer", getConsumerName(entityClass, repositoryClass));
-                deadLetterMessage.put("group", getConsumerGroup(repositoryClass));
+                deadLetterMessage.put(DLQ_REASON_KEY, dlqReason);
+                deadLetterMessage.put(DLQ_ERROR_KEY, e.getMessage());
+                deadLetterMessage.put(DLQ_STREAM_KEY, message.getStream());
+                deadLetterMessage.put(DLQ_STREAM_ID_KEY, message.getId().getValue());
+                deadLetterMessage.put(DLQ_CONSUMER_KEY, getConsumerName(entityClass));
+                deadLetterMessage.put(DLQ_GROUP_KEY, getConsumerGroup(entityClass));
+                deadLetterMessage.put(DLQ_ATTEMPTS_KEY, String.valueOf(attempts));
+                deadLetterMessage.put(DLQ_EXCEPTION_CLASS_KEY, e.getClass().getName());
+                deadLetterMessage.put(DLQ_FAILURE_TIMESTAMP_KEY, Instant.now().toString());
+                if (e instanceof ProcessMessageException processMessageException && processMessageException.getFailedStore() != null) {
+                    deadLetterMessage.put(DLQ_FAILED_STORE_KEY, processMessageException.getFailedStore());
+                }
 
                 redisTemplate.opsForStream().add(
                         StreamRecords.newRecord()
@@ -282,7 +279,7 @@ public abstract class AbstractPendingMessageHandler<T, R> implements MessageHand
                                 .withStreamKey(deadLetterKey)
                 );
                 logger.warn("Message {} moved to dead letter queue for manual processing.", message.getId());
-                redisTemplate.opsForStream().acknowledge(getConsumerGroup(repositoryClass), message);
+                redisTemplate.opsForStream().acknowledge(getConsumerGroup(entityClass), message);
                 logger.warn("And Message {} acknowledged.", message.getId());
             }
         } catch (Exception dlqError) {

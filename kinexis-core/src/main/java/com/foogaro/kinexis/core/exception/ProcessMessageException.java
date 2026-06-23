@@ -1,5 +1,8 @@
 package com.foogaro.kinexis.core.exception;
 
+import java.util.Collection;
+import java.util.List;
+
 /**
  * Checked exception thrown when an error occurs during message processing.
  * This exception is used to indicate that a message could not be processed
@@ -8,10 +11,15 @@ package com.foogaro.kinexis.core.exception;
  */
 public class ProcessMessageException extends Exception {
 
+    private final String failedStore;
+    private final List<String> failedStores;
+
     /**
      * Constructs a new ProcessMessageException with no detail message.
      */
     public ProcessMessageException() {
+        this.failedStore = null;
+        this.failedStores = List.of();
     }
 
     /**
@@ -21,6 +29,8 @@ public class ProcessMessageException extends Exception {
      */
     public ProcessMessageException(String message) {
         super(message);
+        this.failedStore = null;
+        this.failedStores = List.of();
     }
 
     /**
@@ -31,6 +41,20 @@ public class ProcessMessageException extends Exception {
      */
     public ProcessMessageException(String message, Throwable cause) {
         super(message, cause);
+        this.failedStore = null;
+        this.failedStores = List.of();
+    }
+
+    public ProcessMessageException(String message, Throwable cause, String failedStore) {
+        super(message, cause);
+        this.failedStore = failedStore;
+        this.failedStores = failedStore == null ? List.of() : List.of(failedStore);
+    }
+
+    public ProcessMessageException(String message, Throwable cause, Collection<String> failedStores) {
+        super(message, cause);
+        this.failedStores = failedStores == null ? List.of() : List.copyOf(failedStores);
+        this.failedStore = this.failedStores.isEmpty() ? null : this.failedStores.getFirst();
     }
 
     /**
@@ -42,6 +66,8 @@ public class ProcessMessageException extends Exception {
      */
     public ProcessMessageException(Throwable cause) {
         super(cause);
+        this.failedStore = null;
+        this.failedStores = List.of();
     }
 
     /**
@@ -55,5 +81,15 @@ public class ProcessMessageException extends Exception {
      */
     public ProcessMessageException(String message, Throwable cause, boolean enableSuppression, boolean writableStackTrace) {
         super(message, cause, enableSuppression, writableStackTrace);
+        this.failedStore = null;
+        this.failedStores = List.of();
+    }
+
+    public String getFailedStore() {
+        return failedStore;
+    }
+
+    public List<String> getFailedStores() {
+        return failedStores;
     }
 }

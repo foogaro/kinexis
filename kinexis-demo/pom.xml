@@ -22,11 +22,9 @@
         <maven.deploy.skip>true</maven.deploy.skip>
         <mysql.version>8.0.30</mysql.version>
         <lombok.version>1.18.34</lombok.version>
-        <redis-om.version>1.0.0-RC2</redis-om.version>
-        <jedis.version>5.1.0</jedis.version>
+        <redis-om.version>2.0.7</redis-om.version>
         <jackson-databind.version>2.17.2</jackson-databind.version>
-        <gson.version>2.10.1</gson.version>
-        <kinexis-core.version>0.2.1</kinexis-core.version>
+        <kinexis-core.version>1.0.0</kinexis-core.version>
         <netty.version>4.1.107.Final</netty.version>
     </properties>
 
@@ -58,11 +56,6 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.data</groupId>
-            <artifactId>spring-data-redis</artifactId>
-            <version>3.2.3</version>
         </dependency>
         <dependency>
             <groupId>mysql</groupId>
@@ -126,7 +119,6 @@
                             <artifactId>kinexis-core</artifactId>
                             <version>${kinexis-core.version}</version>
                         </path>
-<!--                        <annotationProcessor>com.foogaro.kinexis.core.processor.CachingPatternsAnnotationProcessor</annotationProcessor>-->
                     </annotationProcessorPaths>
                     <showWarnings>true</showWarnings>
                     <compilerArgs>

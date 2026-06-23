@@ -6,8 +6,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.util.HashMap;
+import java.util.Arrays;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Utility class for finding and analyzing caching pattern annotations on entity classes.
@@ -20,7 +23,7 @@ public class AnnotationFinder {
 
     private final Logger logger = LoggerFactory.getLogger(getClass());
 
-    private final Map<Class<?>, Integer> entities = new HashMap<>();
+    private final Map<Class<?>, CachingMetadata> entities = new ConcurrentHashMap<>();
 
     /**
      * Default constructor for AnnotationFinder.
@@ -37,8 +40,7 @@ public class AnnotationFinder {
      * @return true if Cache-Aside pattern is enabled, false otherwise
      */
     public boolean hasCacheAside(Class<?> entityClass) {
-        checkMap(entityClass);
-        return match(CachingPattern.CACHE_ASIDE.getValue(), entities.get(entityClass));
+        return match(CachingPattern.CACHE_ASIDE.getValue(), metadata(entityClass).patterns());
     }
 
     /**
@@ -49,8 +51,7 @@ public class AnnotationFinder {
      * @return true if Refresh-Ahead pattern is enabled, false otherwise
      */
     public boolean hasRefreshAhead(Class<?> entityClass) {
-        checkMap(entityClass);
-        return match(CachingPattern.REFRESH_AHEAD.getValue(), entities.get(entityClass));
+        return match(CachingPattern.REFRESH_AHEAD.getValue(), metadata(entityClass).patterns());
     }
 
     /**
@@ -61,8 +62,27 @@ public class AnnotationFinder {
      * @return true if Write-Behind pattern is enabled, false otherwise
      */
     public boolean hasWriteBehind(Class<?> entityClass) {
-        checkMap(entityClass);
-        return match(CachingPattern.WRITE_BEHIND.getValue(), entities.get(entityClass));
+        return match(CachingPattern.WRITE_BEHIND.getValue(), metadata(entityClass).patterns());
+    }
+
+    public boolean isEnabled(Class<?> entityClass) {
+        return metadata(entityClass).enabled();
+    }
+
+    public boolean hasCachingPatterns(Class<?> entityClass) {
+        return entityClass.isAnnotationPresent(CachingPatterns.class);
+    }
+
+    public Set<CachingPattern> patterns(Class<?> entityClass) {
+        if (!entityClass.isAnnotationPresent(CachingPatterns.class)) {
+            return Set.of(CachingPattern.NONE);
+        }
+        return Arrays.stream(entityClass.getAnnotation(CachingPatterns.class).patterns())
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    public long ttl(Class<?> entityClass) {
+        return metadata(entityClass).ttl();
     }
 
     /**
@@ -73,18 +93,23 @@ public class AnnotationFinder {
      *
      * @param entityClass the class to analyze for caching patterns
      */
-    private void checkMap(Class<?> entityClass) {
-        Integer cacheType = entities.get(entityClass);
-        if (cacheType == null) {
-            cacheType = CachingPattern.NONE.getValue();
+    private CachingMetadata metadata(Class<?> entityClass) {
+        return entities.computeIfAbsent(entityClass, ignored -> {
+            int cacheType = CachingPattern.NONE.getValue();
+            boolean enabled = true;
+            long ttl = 0;
             if (entityClass.isAnnotationPresent(CachingPatterns.class)) {
                 CachingPatterns cachingPatterns = entityClass.getAnnotation(CachingPatterns.class);
+                enabled = cachingPatterns.enabled();
+                ttl = cachingPatterns.ttl();
                 for (CachingPattern pattern : cachingPatterns.patterns()) {
                     cacheType = cacheType + pattern.getValue();
                 }
             }
-            entities.put(entityClass, cacheType);
-        }
+            logger.debug("Resolved Kinexis metadata for {}: enabled={}, ttl={}, patterns={}",
+                    entityClass.getSimpleName(), enabled, ttl, cacheType);
+            return new CachingMetadata(cacheType, enabled, ttl);
+        });
     }
 
     /**
@@ -97,5 +122,8 @@ public class AnnotationFinder {
      */
     private boolean match(int cacheType, int entityCacheType) {
         return (cacheType & entityCacheType) > 0;
+    }
+
+    private record CachingMetadata(int patterns, boolean enabled, long ttl) {
     }
 }

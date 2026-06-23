@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.util.*;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
@@ -23,7 +24,7 @@ public class BeanFinder {
 
     private final Logger logger = LoggerFactory.getLogger(getClass());
 
-    private Map<String, ?> allBeans;
+    private final Map<String, ?> allBeans;
 
     /**
      * Constructs a new BeanFinder with the specified ListableBeanFactory.
@@ -37,119 +38,6 @@ public class BeanFinder {
     }
 
     /**
-     * Finds all repositories that can handle a specific entity type.
-     *
-     * @param entityClass the class of the entity
-     * @param repositoryClass the class of the repository
-     * @param <T> the type of entity
-     * @return a list of repositories that can handle the specified entity type
-     */
-    public <T> List<Repository<T, ?>> findRepositoriesForEntity(Class<T> entityClass, Class<?> repositoryClass) {
-        return allBeans.values()
-                .stream()
-                .filter(bean -> bean instanceof Repository)
-                .map(bean -> (Repository<T, ?>) bean)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Finds all repositories of a specific class type.
-     *
-     * @param repositoryClass the class of the repository to find
-     * @param <T> the type of entity the repository handles
-     * @return a list of repositories of the specified class
-     */
-    @SuppressWarnings("unchecked")
-    public <T> List<Repository<T, ?>> findRepositoriesForEntity(Class<?> repositoryClass) {
-        return allBeans.values()
-                .stream()
-                .filter(bean -> bean instanceof Repository)
-                .map(bean -> (Repository<T, ?>) bean)
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Finds all KinexisService instances that match a specific service class.
-     * Handles both proxy and non-proxy service instances.
-     *
-     * @param serviceClass the class of the service to find
-     * @param <T> the type of entity the service handles
-     * @return a list of matching KinexisService instances
-     */
-    @SuppressWarnings("unchecked")
-    public <T> List<KinexisService<T>> findServiceByServiceClass(Class<?> serviceClass) {
-        logger.debug("Finding service for class: {}", serviceClass.getSimpleName());
-        logger.debug("Looking for service with name: {}", serviceClass.getSimpleName());
-        
-        List<KinexisService<T>> services = allBeans.values()
-                .stream()
-                .filter(bean -> {
-                    Class<?> beanClass = bean.getClass();
-                    boolean isProxy = beanClass.getName().contains("$Proxy") ||
-                                    beanClass.getName().contains("$JdkDynamicAopProxy");
-                    
-                    // Get the actual class, handling both proxy and non-proxy cases
-                    Class<?> actualClass = isProxy ?
-                        Arrays.stream(beanClass.getInterfaces())
-                            .filter(i -> i.getSimpleName().equals(serviceClass.getSimpleName()))
-                            .findFirst()
-                            .orElse(beanClass) : 
-                        beanClass;
-                    
-                    // Check if it's a KinexisService
-                    boolean isService = KinexisService.class.isAssignableFrom(actualClass);
-                    
-                    // For generic types, we need to check the raw type name
-                    String actualClassName = actualClass.getSimpleName();
-                    String serviceClassName = serviceClass.getSimpleName();
-                    boolean nameMatches = actualClassName.equals(serviceClassName);
-                    
-                    // Log detailed information about the bean
-                    logger.debug("Bean: {} - Is proxy: {}, Actual class: {}, Is service: {}, Name matches: {}",
-                        beanClass.getName(), isProxy, actualClass.getName(), isService, nameMatches);
-                    
-                    // If it's a proxy, also log the interfaces
-                    if (isProxy) {
-                        logger.debug("Bean interfaces: {}", 
-                            Arrays.stream(beanClass.getInterfaces())
-                                .map(Class::getName)
-                                .collect(Collectors.joining(", ")));
-                    }
-                    
-                    // Check if the bean is a KinexisService and matches the service class name
-                    return isService && (nameMatches || actualClass.getName().equals(serviceClass.getName()));
-                })
-                .map(bean -> (KinexisService<T>) bean)
-                .collect(Collectors.toList());
-        
-        if (services.isEmpty()) {
-            logger.warn("No service found for class: {}. Available beans: {}", 
-                serviceClass.getSimpleName(),
-                allBeans.keySet().stream()
-                    .filter(name -> name.contains("Service"))
-                    .collect(Collectors.joining(", ")));
-            
-            // Log all KinexisService instances
-            logger.debug("All KinexisService instances: {}",
-                allBeans.values().stream()
-                    .filter(bean -> bean instanceof KinexisService)
-                    .map(bean -> bean.getClass().getName())
-                    .collect(Collectors.joining(", ")));
-            
-            // Log all beans that might be services
-            logger.debug("All potential service beans: {}", 
-                allBeans.entrySet().stream()
-                    .filter(entry -> entry.getKey().contains("Service"))
-                    .map(entry -> entry.getKey() + " -> " + entry.getValue().getClass().getName())
-                    .collect(Collectors.joining(", ")));
-        } else {
-            logger.debug("Found {} services for class: {}", services.size(), serviceClass.getSimpleName());
-        }
-        
-        return services;
-    }
-
-    /**
      * Finds all repositories that match a specific repository class name.
      * Handles both proxy and non-proxy repository instances.
      *
@@ -159,16 +47,13 @@ public class BeanFinder {
      */
     @SuppressWarnings("unchecked")
     public <T> List<Repository<T, ?>> findRepositoriesForEntity(String repositoryClassName) {
-//        allBeans = listableBeanFactory.getBeansOfType(Object.class);
         List<Repository<T, ?>> repositories = allBeans.values()
                 .stream()
                 .filter(bean -> {
                     Class<?> beanClass = bean.getClass();
-                    // Check if the bean is a Spring Data JPA proxy
                     boolean isProxy = beanClass.getName().contains("$Proxy") || 
                                     beanClass.getName().contains("$JdkDynamicAopProxy");
                     
-                    // Get the actual interface class if it's a proxy
                     Class<?> actualClass = isProxy ? 
                         Arrays.stream(beanClass.getInterfaces())
                             .filter(i -> i.getSimpleName().equals(repositoryClassName))
@@ -185,6 +70,53 @@ public class BeanFinder {
                 .map(bean -> (Repository<T, ?>) bean)
                 .collect(Collectors.toList());
         return repositories;
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> List<Repository<T, ?>> findRepositoriesForEntity(Class<T> entityType) {
+        return allBeans.values()
+                .stream()
+                .filter(bean -> repositoryEntityType(bean)
+                        .map(type -> type.equals(entityType))
+                        .orElse(false))
+                .map(bean -> (Repository<T, ?>) bean)
+                .collect(Collectors.toList());
+    }
+
+    private Optional<Class<?>> repositoryEntityType(Object bean) {
+        for (Type genericInterface : bean.getClass().getGenericInterfaces()) {
+            Optional<Class<?>> entityType = repositoryEntityType(genericInterface);
+            if (entityType.isPresent()) {
+                return entityType;
+            }
+        }
+        for (Class<?> repositoryInterface : bean.getClass().getInterfaces()) {
+            if (!Repository.class.isAssignableFrom(repositoryInterface)) {
+                continue;
+            }
+            for (Type genericInterface : repositoryInterface.getGenericInterfaces()) {
+                Optional<Class<?>> entityType = repositoryEntityType(genericInterface);
+                if (entityType.isPresent()) {
+                    return entityType;
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private Optional<Class<?>> repositoryEntityType(Type genericInterface) {
+        if (!(genericInterface instanceof ParameterizedType parameterizedType)) {
+            return Optional.empty();
+        }
+        if (!(parameterizedType.getRawType() instanceof Class<?> rawType)
+                || !Repository.class.isAssignableFrom(rawType)) {
+            return Optional.empty();
+        }
+        Type entityType = parameterizedType.getActualTypeArguments()[0];
+        if (entityType instanceof Class<?> entityClass) {
+            return Optional.of(entityClass);
+        }
+        return Optional.empty();
     }
 
     /**
@@ -235,21 +167,6 @@ public class BeanFinder {
             logger.error("Failed to create ID of type {} with value {}", idType, value, e);
             throw new IllegalArgumentException("Cannot create ID", e);
         }
-    }
-
-    /**
-     * Executes an operation on a repository with a parameter.
-     *
-     * @param repository the repository to operate on
-     * @param param the parameter for the operation
-     * @param operation the operation to execute
-     * @param <T> the type of entity the repository handles
-     * @param <P> the type of parameter for the operation
-     */
-    public <T, P> void executeOperation(Repository<T, ?> repository, P param,
-                                        BiConsumer<CrudRepository<T, ?>, P> operation) {
-        CrudRepository<T, ?> crudRepo = asCrudRepository(repository);
-        operation.accept(crudRepo, param);
     }
 
     /**

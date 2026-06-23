@@ -5,7 +5,6 @@ import com.foogaro.kinexis.core.model.CachingFormat;
 import com.foogaro.kinexis.core.model.CachingPattern;
 import com.palantir.javapoet.*;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.repository.CrudRepository;
 import org.springframework.stereotype.Component;
 import org.springframework.stereotype.Repository;
 
@@ -13,21 +12,18 @@ import javax.annotation.processing.*;
 import javax.annotation.processing.AbstractProcessor;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.*;
-import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import java.io.IOException;
 import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 
 /**
  * Annotation processor for the {@link CachingPatterns} annotation.
  * This processor generates the necessary classes for implementing caching patterns
- * in Redis, including StreamListeners, Processors, ProcessOrchestrators,
+ * in Redis, including StreamListeners, Processors,
  * PendingMessageHandlers, and KeyExpirationListeners.
  */
 @SupportedAnnotationTypes("com.foogaro.kinexis.core.annotation.CachingPatterns")
@@ -83,8 +79,8 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
     /**
      * Processes the annotations and generates the necessary classes.
      * For each class annotated with {@link CachingPatterns}, this method:
-     * 1. Finds all repositories managing the entity
-     * 2. Generates StreamListener, Processor, ProcessOrchestrator, and PendingMessageHandler for each repository
+     * 1. Generates a Redis repository for the entity cache
+     * 2. Generates one StreamListener, Processor, and PendingMessageHandler for each entity
      * 3. Generates KeyExpirationListener if the entity uses REFRESH_AHEAD pattern
      *
      * @param annotations the annotation types to process
@@ -100,8 +96,7 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
 
         Set<? extends Element> elements = roundEnv.getElementsAnnotatedWith(CachingPatterns.class);
         if (elements.isEmpty()) {
-            warning("No entities found with annotation %s", CachingPatterns.class.getSimpleName());
-            return false;
+            return !annotations.isEmpty();
         }
 
         processingEnv.getMessager().printMessage(
@@ -117,37 +112,32 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
                 }
 
                 TypeElement entityElement = (TypeElement) element;
+                CachingPatterns cachingPatterns = element.getAnnotation(CachingPatterns.class);
                 String className = entityElement.getSimpleName().toString();
                 String packageName = elementUtils.getPackageOf(entityElement).getQualifiedName().toString() + "." + className.toLowerCase();
-                // Finds all repos managing the entity
-                Set<TypeElement> repositories = findRepositoriesForEntity(roundEnv, entityElement);
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating RedisRepository(s), StreamListener(s), Processors(s), ProcessOrchestrator(s) and PendingMessageHandler(s)");
-                for (TypeElement repository : repositories) {
-                    generateStreamListener(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tStreamListener for: " + repository);
-                    generateProcessor(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessor for: " + repository);
-                    generateProcessOrchestrator(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessOrchestrator for: " + repository);
-                    generatePendingMessageHandler(packageName, className, entityElement, TypeName.get(repository.asType()));
-                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tPendingMessageHandler for: " + repository);
+                TypeName entityType = TypeName.get(entityElement.asType());
+                generateEntityRegistry(packageName, className, entityElement);
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE, "\tEntityRegistry for: " + entityElement);
+                if (!cachingPatterns.enabled()) {
+                    processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
+                            "Skipping Kinexis component generation for disabled entity: " + entityElement);
+                    continue;
                 }
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating RedisRepository, RedisStreamListener, RedisProcessors, RedisProcessOrchestrator and RedisPendingMessageHandler");
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating RedisRepository and entity stream components");
                 String newRedisRepository = generateRedisRepository(packageName, className, entityElement);
                 assert newRedisRepository != null;
                 processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tRedisRepository for: " + entityElement);
-                generateStreamListener(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tStreamListener for: " + newRedisRepository);
-                generateProcessor(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessor for: " + newRedisRepository);
-                generateProcessOrchestrator(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessOrchestrator for: " + newRedisRepository);
-                generatePendingMessageHandler(packageName, className, entityElement, ClassName.bestGuess(newRedisRepository));
-                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tPendingMessageHandler for: " + newRedisRepository);
+                generateStreamListener(packageName, className, entityElement, entityType);
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tStreamListener for: " + entityElement);
+                generateProcessor(packageName, className, entityElement, entityType);
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tProcessor for: " + entityElement);
+                generatePendingMessageHandler(packageName, className, entityElement, entityType);
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"\tPendingMessageHandler for: " + entityElement);
 
                 processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,"Generating KeyExpirationListener(s)");
-                Arrays.stream(element.getAnnotation(CachingPatterns.class).patterns())
+                Arrays.stream(cachingPatterns.patterns())
                         .filter(pattern -> pattern.getValue() == CachingPattern.REFRESH_AHEAD.getValue())
+                        .filter(pattern -> cachingPatterns.ttl() > 0)
                         .findFirst()
                         .ifPresent(pattern -> {
                             generateKeyExpirationListener(packageName, className, entityElement);
@@ -158,82 +148,6 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
             error(null, "Error processing @CachingPatterns annotation: %s", e.getMessage());
         }
         return true;
-    }
-
-    private TypeElement getTypeElementFromName(String className) {
-        try {
-            return elementUtils.getTypeElement(className);
-        } catch (Exception e) {
-            processingEnv.getMessager().printMessage(Diagnostic.Kind.WARNING,
-                    "Could not find type element for: " + className);
-            return null;
-        }
-    }
-
-    /**
-     * Finds all repositories that manage the given entity.
-     * Searches for interfaces and classes annotated with {@link Repository}
-     * that extend {@link CrudRepository} with the entity as its type parameter.
-     *
-     * @param roundEnv the current round environment
-     * @param entityElement the entity element to find repositories for
-     * @return a set of repository type elements
-     */
-    private Set<TypeElement> findRepositoriesForEntity(RoundEnvironment roundEnv, TypeElement entityElement) {
-        Set<TypeElement> repositories = new HashSet<>();
-
-        for (Element element : roundEnv.getElementsAnnotatedWith(Repository.class)) {
-            if (element.getKind() != ElementKind.INTERFACE && element.getKind() != ElementKind.CLASS) {
-                continue;
-            }
-
-            TypeElement repository = (TypeElement) element;
-            if (isRepositoryForEntity(repository, entityElement)) {
-                repositories.add(repository);
-            }
-        }
-
-        return repositories;
-    }
-
-    /**
-     * Checks if a repository manages a specific entity.
-     * Verifies that the repository extends {@link CrudRepository} with the entity
-     * as its first type parameter.
-     *
-     * @param repository the repository to check
-     * @param entity the entity to check against
-     * @return true if the repository manages the entity
-     */
-    private boolean isRepositoryForEntity(TypeElement repository, TypeElement entity) {
-        for (TypeMirror superInterface : repository.getInterfaces()) {
-            DeclaredType declaredType = (DeclaredType) superInterface;
-            TypeElement interfaceElement = (TypeElement) declaredType.asElement();
-
-            // Checks if it's a CrudRepository or one of its subclass
-            if (implementsCrudRepository(interfaceElement)) {
-                List<? extends TypeMirror> typeArguments = declaredType.getTypeArguments();
-                if (!typeArguments.isEmpty() &&
-                        typeUtils.isSameType(typeArguments.get(0), entity.asType())) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Checks if a type implements {@link CrudRepository}.
-     *
-     * @param type the type to check
-     * @return true if the type implements CrudRepository
-     */
-    private boolean implementsCrudRepository(TypeElement type) {
-        TypeElement crudRepositoryType = elementUtils.getTypeElement(CrudRepository.class.getCanonicalName());
-        return typeUtils.isAssignable(
-                type.asType(),
-                typeUtils.erasure(crudRepositoryType.asType())
-        );
     }
 
     private String generateRedisRepository(String packageName, String className, TypeElement entityElement) {
@@ -310,141 +224,43 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
     }
 
     /**
-     * Generates a StreamListener class for the given entity and repository.
+     * Generates a StreamListener class for the given entity.
      * The generated class extends {@link com.foogaro.kinexis.core.listener.AbstractStreamListener} and includes
      * necessary fields and methods for handling Redis Stream messages.
      *
      * @param packageName the package name for the generated class
      * @param className the entity class name
      * @param entityElement the entity type element
-     * @param repository the repository type element
+     * @param streamType the stream target type
      */
     private void generateStreamListener(String packageName, String className,
-                                        TypeElement entityElement, TypeName repository) {
-        String listenerClassName = getRepositorySimpleName(repository) + "StreamListener";
+                                        TypeElement entityElement, TypeName streamType) {
+        String listenerClassName = getTypeSimpleName(streamType) + "StreamListener";
 
         TypeName superclass = ParameterizedTypeName.get(
                 ClassName.get(basePackage + ".listener", "AbstractStreamListener"),
-                TypeName.get(entityElement.asType()),
-                repository
+                TypeName.get(entityElement.asType())
         );
 
-        FieldSpec repositoryField = FieldSpec.builder(
-                        repository,
-                        getRepositoryInstanceName(repository),
-                        Modifier.PRIVATE)
-                .addAnnotation(Autowired.class)
-                .build();
-
-        FieldSpec redisTemplateField = FieldSpec.builder(
-                        ParameterizedTypeName.get(
-                                ClassName.get("org.springframework.data.redis.core", "RedisTemplate"),
-                                ClassName.get(String.class),
-                                ClassName.get(String.class)),
-                        "redisTemplate",
-                        Modifier.PRIVATE)
-                .addAnnotation(Autowired.class)
-                .build();
-
-        FieldSpec streamMessageListenerContainerField = FieldSpec.builder(
-                        ParameterizedTypeName.get(
-                                ClassName.get("org.springframework.data.redis.stream", "StreamMessageListenerContainer"),
-                                ClassName.get(String.class),
-                                ParameterizedTypeName.get(
-                                        ClassName.get("org.springframework.data.redis.connection.stream", "MapRecord"),
-                                        ClassName.get(String.class),
-                                        ClassName.get(String.class),
-                                        ClassName.get(String.class))),
-                        "streamMessageListenerContainer",
-                        Modifier.PRIVATE)
-                .addAnnotation(Autowired.class)
-                .build();
-
-        FieldSpec objectMapperField = FieldSpec.builder(
-                        ClassName.get("com.fasterxml.jackson.databind", "ObjectMapper"),
-                        "objectMapper",
-                        Modifier.PRIVATE)
-                .addAnnotation(Autowired.class)
-                .build();
-
-        FieldSpec processOrchestratorField = FieldSpec.builder(
-                        ClassName.get(packageName + ".orchestrator", getRepositorySimpleName(repository) + "ProcessOrchestrator"),
-                        getRepositoryInstanceName(repository) + "ProcessOrchestrator",
-                        Modifier.PRIVATE)
-                .addAnnotation(Autowired.class)
-                .build();
-
         FieldSpec processorField = FieldSpec.builder(
-                        ClassName.get(packageName + ".processor", getRepositorySimpleName(repository) + "Processor"),
-                        getRepositoryInstanceName(repository) + "Processor",
+                        ClassName.get(packageName + ".processor", getTypeSimpleName(streamType) + "Processor"),
+                        getTypeInstanceName(streamType) + "Processor",
                         Modifier.PRIVATE)
                 .addAnnotation(Autowired.class)
-                .build();
-
-        MethodSpec getRedisTemplateMethod = MethodSpec.methodBuilder("getRedisTemplate")
-                .addAnnotation(Override.class)
-                .addModifiers(Modifier.PUBLIC)
-                .returns(redisTemplateField.type())
-                .addStatement("return redisTemplate")
-                .build();
-
-        MethodSpec getStreamListenerContainerMethod = MethodSpec.methodBuilder("getStreamMessageListenerContainer")
-                .addAnnotation(Override.class)
-                .addModifiers(Modifier.PUBLIC)
-                .returns(streamMessageListenerContainerField.type())
-                .addStatement("return streamMessageListenerContainer")
-                .build();
-
-        MethodSpec getObjectMapperMethod = MethodSpec.methodBuilder("getObjectMapper")
-                .addAnnotation(Override.class)
-                .addModifiers(Modifier.PUBLIC)
-                .returns(objectMapperField.type())
-                .addStatement("return objectMapper")
-                .build();
-
-        MethodSpec deleteEntityMethod = MethodSpec.methodBuilder("deleteEntity")
-                .addModifiers(Modifier.PROTECTED)
-                .addParameter(Object.class, "id")
-                .addStatement(getRepositoryInstanceName(repository) + ".deleteById(($T) id)", Long.class)
-                .build();
-
-        MethodSpec saveEntityMethod = MethodSpec.methodBuilder("saveEntity")
-                .addModifiers(Modifier.PROTECTED)
-                .addParameter(TypeName.get(entityElement.asType()), "entity")
-                .returns(TypeName.get(entityElement.asType()))
-                .addStatement("return " + getRepositoryInstanceName(repository) + ".save(entity)")
-                .build();
-
-        MethodSpec getProcessOrchestratorMethod = MethodSpec.methodBuilder("getProcessOrchestrator")
-                .addAnnotation(Override.class)
-                .addModifiers(Modifier.PUBLIC)
-                .returns(ClassName.get(packageName + ".orchestrator", getRepositorySimpleName(repository) + "ProcessOrchestrator"))
-                .addStatement("return " + getRepositoryInstanceName(repository) + "ProcessOrchestrator")
                 .build();
 
         MethodSpec getProcessorMethod = MethodSpec.methodBuilder("getProcessor")
                 .addAnnotation(Override.class)
                 .addModifiers(Modifier.PUBLIC)
-                .returns(ClassName.get(packageName + ".processor", getRepositorySimpleName(repository) + "Processor"))
-                .addStatement("return " + getRepositoryInstanceName(repository) + "Processor")
+                .returns(ClassName.get(packageName + ".processor", getTypeSimpleName(streamType) + "Processor"))
+                .addStatement("return " + getTypeInstanceName(streamType) + "Processor")
                 .build();
 
         TypeSpec streamListenerClass = TypeSpec.classBuilder(listenerClassName)
                 .addModifiers(Modifier.PUBLIC)
                 .superclass(superclass)
                 .addAnnotation(Component.class)
-                .addField(repositoryField)
-                .addField(redisTemplateField)
-                .addField(streamMessageListenerContainerField)
-                .addField(objectMapperField)
-                .addField(processOrchestratorField)
                 .addField(processorField)
-                .addMethod(getRedisTemplateMethod)
-                .addMethod(getStreamListenerContainerMethod)
-                .addMethod(getObjectMapperMethod)
-                .addMethod(deleteEntityMethod)
-                .addMethod(saveEntityMethod)
-                .addMethod(getProcessOrchestratorMethod)
                 .addMethod(getProcessorMethod)
                 .build();
 
@@ -452,110 +268,52 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
     }
 
     /**
-     * Generates a Processor class for the given entity and repository.
+     * Generates a Processor class for the given entity.
      * The generated class implements the necessary processing logic for Redis Stream messages.
      *
      * @param packageName the package name for the generated class
      * @param className the entity class name
      * @param entityElement the entity type element
-     * @param repository the repository type element
+     * @param streamType the stream target type
      */
     private void generateProcessor(String packageName, String className,
-                                   TypeElement entityElement, TypeName repository) {
-        String processorClassName = getRepositorySimpleName(repository) + "Processor";
+                                   TypeElement entityElement, TypeName streamType) {
+        String processorClassName = getTypeSimpleName(streamType) + "Processor";
 
         TypeName superclass = ParameterizedTypeName.get(
                 ClassName.get(basePackage + ".processor", "AbstractProcessor"),
-                TypeName.get(entityElement.asType()),
-                repository
+                TypeName.get(entityElement.asType())
         );
-
-        FieldSpec beanFactoryField = FieldSpec.builder(
-                        ClassName.get("org.springframework.beans.factory", "ListableBeanFactory"),
-                        "beanFactory",
-                        Modifier.PRIVATE)
-                .addAnnotation(Autowired.class)
-                .build();
-
-        FieldSpec beanFinderField = FieldSpec.builder(
-                        ClassName.get(basePackage + ".service", "BeanFinder"),
-                        "beanFinder",
-                        Modifier.PRIVATE)
-                .build();
-
-        MethodSpec getRepositoryFinderMethod = MethodSpec.methodBuilder("getRepositoryFinder")
-                .addAnnotation(Override.class)
-                .addModifiers(Modifier.PUBLIC)
-                .returns(ClassName.get(basePackage + ".service", "BeanFinder"))
-                .beginControlFlow("if (beanFinder == null)")
-                .addStatement("beanFinder = new $T(beanFactory)",
-                        ClassName.get(basePackage + ".service", "BeanFinder"))
-                .endControlFlow()
-                .addStatement("return beanFinder")
-                .build();
 
         TypeSpec processorClass = TypeSpec.classBuilder(processorClassName)
                 .addModifiers(Modifier.PUBLIC)
                 .superclass(superclass)
                 .addAnnotation(Component.class)
-                .addField(beanFactoryField)
-                .addField(beanFinderField)
-                .addMethod(getRepositoryFinderMethod)
                 .build();
 
         writeJavaFile(packageName + ".processor", processorClass);
     }
 
     /**
-     * Generates a ProcessOrchestrator class for the given entity and repository.
-     * The generated class coordinates the message processing flow.
-     *
-     * @param packageName the package name for the generated class
-     * @param className the entity class name
-     * @param entityElement the entity type element
-     * @param repository the repository type element
-     */
-    private void generateProcessOrchestrator(String packageName, String className,
-                                             TypeElement entityElement, TypeName repository) {
-        String orchestratorClassName = getRepositorySimpleName(repository) + "ProcessOrchestrator";
-
-        TypeName superclass = ParameterizedTypeName.get(
-                ClassName.get(basePackage + ".orchestrator", "AbstractProcessOrchestrator"),
-                TypeName.get(entityElement.asType()),
-                repository
-        );
-
-
-        TypeSpec processOrchestratorClass = TypeSpec.classBuilder(orchestratorClassName)
-                .addModifiers(Modifier.PUBLIC)
-                .superclass(superclass)
-                .addAnnotation(Component.class)
-                .build();
-
-        writeJavaFile(packageName + ".orchestrator", processOrchestratorClass);
-    }
-
-    /**
-     * Generates a PendingMessageHandler class for the given entity and repository.
+     * Generates a PendingMessageHandler class for the given entity.
      * The generated class handles messages that have been delivered but not acknowledged.
      *
      * @param packageName the package name for the generated class
      * @param className the entity class name
      * @param entityElement the entity type element
-     * @param repository the repository type element
+     * @param streamType the stream target type
      */
     private void generatePendingMessageHandler(String packageName, String className,
-                                               TypeElement entityElement, TypeName repository) {
-        String handlerClassName = getRepositorySimpleName(repository) + "PendingMessageHandler";
+                                               TypeElement entityElement, TypeName streamType) {
+        String handlerClassName = getTypeSimpleName(streamType) + "PendingMessageHandler";
 
         TypeName superclass = ParameterizedTypeName.get(
                 ClassName.get(basePackage + ".handler", "AbstractPendingMessageHandler"),
-                TypeName.get(entityElement.asType()),
-                repository
+                TypeName.get(entityElement.asType())
         );
 
         FieldSpec processorField = FieldSpec.builder(
-                        ClassName.get(packageName + ".processor", getRepositorySimpleName(repository) + "Processor"),
+                        ClassName.get(packageName + ".processor", getTypeSimpleName(streamType) + "Processor"),
                         "processor",
                         Modifier.PRIVATE)
                 .addAnnotation(Autowired.class)
@@ -564,7 +322,7 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
         MethodSpec getProcessorMethod = MethodSpec.methodBuilder("getProcessor")
                 .addAnnotation(Override.class)
                 .addModifiers(Modifier.PUBLIC)
-                .returns(ClassName.get(packageName + ".processor", getRepositorySimpleName(repository) + "Processor"))
+                .returns(ClassName.get(packageName + ".processor", getTypeSimpleName(streamType) + "Processor"))
                 .addStatement("return processor")
                 .build();
 
@@ -577,6 +335,29 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
                 .build();
 
         writeJavaFile(packageName + ".handler", handler);
+    }
+
+    private void generateEntityRegistry(String packageName, String className, TypeElement entityElement) {
+        TypeName classWildcard = ParameterizedTypeName.get(
+                ClassName.get(Class.class),
+                WildcardTypeName.subtypeOf(Object.class));
+        TypeName entityTypesReturnType = ParameterizedTypeName.get(ClassName.get(Set.class), classWildcard);
+
+        MethodSpec entityTypesMethod = MethodSpec.methodBuilder("entityTypes")
+                .addAnnotation(Override.class)
+                .addModifiers(Modifier.PUBLIC)
+                .returns(entityTypesReturnType)
+                .addStatement("return $T.of($T.class)", ClassName.get(Set.class), TypeName.get(entityElement.asType()))
+                .build();
+
+        TypeSpec registry = TypeSpec.classBuilder(className + "KinexisEntityRegistry")
+                .addModifiers(Modifier.PUBLIC)
+                .addSuperinterface(ClassName.get(basePackage + ".service", "KinexisEntityRegistry"))
+                .addAnnotation(Component.class)
+                .addMethod(entityTypesMethod)
+                .build();
+
+        writeJavaFile(packageName, registry);
     }
 
     /**
@@ -621,7 +402,9 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
                 .addAnnotation(Override.class)
                 .addModifiers(Modifier.PROTECTED)
                 .returns(String.class)
-                .addStatement("return \"$L:\"", entityElement.getQualifiedName().toString())
+                .addStatement("return $T.getEntityKeyPrefix($T.class) + \":\"",
+                        ClassName.get(basePackage, "Misc"),
+                        TypeName.get(entityElement.asType()))
                 .build();
 
         // Create the class
@@ -667,21 +450,13 @@ public class CachingPatternsAnnotationProcessor extends AbstractProcessor {
                 String.format(message, args), element);
     }
 
-    private void warning(String message, Object... args) {
-        messager.printMessage(Diagnostic.Kind.WARNING, String.format(message, args));
-    }
-
-    private void warning(Element element, String message, Object... args) {
-        messager.printMessage(Diagnostic.Kind.WARNING, String.format(message, args), element);
-    }
-
-    private String getRepositoryInstanceName(TypeName repository) {
-        final String className = repository.toString().substring(repository.toString().lastIndexOf(".")+1);
+    private String getTypeInstanceName(TypeName typeName) {
+        final String className = typeName.toString().substring(typeName.toString().lastIndexOf(".")+1);
         return className.substring(0, 1).toLowerCase() + className.substring(1);
     }
 
-    private String getRepositorySimpleName(TypeName repository) {
-        return repository.toString().substring(repository.toString().lastIndexOf(".")+1);
+    private String getTypeSimpleName(TypeName typeName) {
+        return typeName.toString().substring(typeName.toString().lastIndexOf(".")+1);
     }
 
 }
