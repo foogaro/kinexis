@@ -5,7 +5,7 @@
 
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-demo</artifactId>
-    <version>1.0.1</version>
+    <version>1.1.0</version>
     <name>kinexis-demo</name>
     <description>A JPA demo for the Java library Kinexis.</description>
 
@@ -21,11 +21,13 @@
         <maven.test.target>21</maven.test.target>
         <maven.deploy.skip>true</maven.deploy.skip>
         <mysql.version>8.0.30</mysql.version>
+        <postgresql.version>42.7.8</postgresql.version>
         <lombok.version>1.18.34</lombok.version>
         <redis-om.version>2.0.7</redis-om.version>
         <jackson-databind.version>2.17.2</jackson-databind.version>
-        <kinexis-core.version>1.0.1</kinexis-core.version>
+        <kinexis-core.version>1.1.0</kinexis-core.version>
         <netty.version>4.1.107.Final</netty.version>
+        <testcontainers.version>1.19.8</testcontainers.version>
     </properties>
 
     <parent>
@@ -58,9 +60,24 @@
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-cassandra</artifactId>
+        </dependency>
+        <dependency>
             <groupId>mysql</groupId>
             <artifactId>mysql-connector-java</artifactId>
             <version>${mysql.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.microsoft.sqlserver</groupId>
+            <artifactId>mssql-jdbc</artifactId>
+            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>org.projectlombok</groupId>
@@ -86,6 +103,46 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-mongodb</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>mysql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>mssqlserver</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

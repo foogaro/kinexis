@@ -52,11 +52,11 @@ At runtime, the flow is:
 Add `kinexis-core` to your Spring Boot application.
 
 ```xml
-<dependency>
-    <groupId>io.github.foogaro</groupId>
-    <artifactId>kinexis-core</artifactId>
-    <version>1.0.1</version>
-</dependency>
+    <dependency>
+        <groupId>io.github.foogaro</groupId>
+        <artifactId>kinexis-core</artifactId>
+        <version>1.1.0</version>
+    </dependency>
 ```
 
 Import Kinexis configuration in your Spring Boot application:

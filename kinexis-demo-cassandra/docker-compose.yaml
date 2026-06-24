@@ -1,0 +1,32 @@
+services:
+  cassandra:
+    image: cassandra:5.0
+    container_name: kinexis-demo-cassandra-cassandra
+    environment:
+      CASSANDRA_CLUSTER_NAME: kinexis
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    ports:
+      - "9042:9042"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  cassandra-init:
+    image: cassandra:5.0
+    container_name: kinexis-demo-cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    command: >
+      bash -c "cqlsh cassandra 9042 -e \"CREATE KEYSPACE IF NOT EXISTS kinexis
+      WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};\""
+    restart: "no"
+
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: kinexis-demo-cassandra-redis
+    ports:
+      - "6383:6379"

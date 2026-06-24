@@ -1,0 +1,16 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: kinexis-demo-sql-server-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Kinexis_password123"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: kinexis-demo-sql-server-redis
+    ports:
+      - "6382:6379"

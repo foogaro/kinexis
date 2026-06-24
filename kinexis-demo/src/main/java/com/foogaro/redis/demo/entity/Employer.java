@@ -12,10 +12,13 @@ import org.springframework.data.mongodb.core.mapping.Document;
 @Entity
 @Table(name = "employers")
 @Document(collection = "employers")
+@org.springframework.data.cassandra.core.mapping.Table("employers")
 @CachingPatterns(format = CachingFormat.JSON, patterns = {CachingPattern.WRITE_BEHIND, CachingPattern.CACHE_ASIDE, CachingPattern.REFRESH_AHEAD})
 public class Employer {
 
     @Id
+    @org.springframework.data.annotation.Id
+    @org.springframework.data.cassandra.core.mapping.PrimaryKey
     private Long id;
 
     @Column(name = "name", nullable = false)

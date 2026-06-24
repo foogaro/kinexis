@@ -5,7 +5,7 @@
 
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>1.0.1</version>
+    <version>1.1.0</version>
     <name>kinexis-core</name>
     <packaging>jar</packaging>
 
