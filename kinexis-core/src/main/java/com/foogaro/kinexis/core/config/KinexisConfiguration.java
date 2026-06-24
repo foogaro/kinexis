@@ -27,12 +27,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
 import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
@@ -101,7 +101,6 @@ public class KinexisConfiguration {
     }
 
     @Bean
-    @Primary
     public LettuceConnectionFactory lettuceConnectionFactory(ClientResources clientResources, ClientOptions clientOptions) {
         LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
                 .clientResources(clientResources)
@@ -183,7 +182,7 @@ public class KinexisConfiguration {
     @ConditionalOnMissingBean
     @SuppressWarnings("deprecation")
     public EntityStoreRegistry entityStoreRegistry(BeanFinder beanFinder, ObjectProvider<EntityStore<?>> entityStores,
-                                                   RedisTemplate<String, String> redisTemplate,
+                                                   @Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate,
                                                    KinexisProperties properties) {
         EntityStoreRegistry fallbackRegistry = properties.getStores().getRepositoryDiscovery().isEnabled()
                 ? new BeanFinderEntityStoreRegistry(beanFinder, redisTemplate)
@@ -193,13 +192,13 @@ public class KinexisConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public EventPublisher eventPublisher(RedisTemplate<String, String> redisTemplate) {
+    public EventPublisher eventPublisher(@Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate) {
         return new RedisStreamEventPublisher(redisTemplate);
     }
 
     @Bean
     @ConditionalOnMissingBean
-    public KinexisDlqService kinexisDlqService(RedisTemplate<String, String> redisTemplate) {
+    public KinexisDlqService kinexisDlqService(@Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate) {
         return new KinexisDlqService(redisTemplate);
     }
 
@@ -242,7 +241,7 @@ public class KinexisConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public KinexisStreamLifecycle kinexisStreamLifecycle(
-            RedisTemplate<String, String> redisTemplate,
+            @Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate,
             StreamMessageListenerContainer<String, MapRecord<String, String, String>> streamMessageListenerContainer) {
         return new KinexisStreamLifecycle(redisTemplate, streamMessageListenerContainer);
     }
@@ -276,7 +275,7 @@ public class KinexisConfiguration {
      * @return an anonymous object that configures Redis on initialization
      */
     @Bean
-    public Object configureRedisKeyExpirationEvents(RedisConnectionFactory redisConnectionFactory) {
+    public Object configureRedisKeyExpirationEvents(@Qualifier("lettuceConnectionFactory") RedisConnectionFactory redisConnectionFactory) {
         return new Object() {
             @PostConstruct
             public void init() {

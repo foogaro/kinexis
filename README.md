@@ -55,7 +55,7 @@ Add `kinexis-core` to your Spring Boot application.
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
 </dependency>
 ```
 

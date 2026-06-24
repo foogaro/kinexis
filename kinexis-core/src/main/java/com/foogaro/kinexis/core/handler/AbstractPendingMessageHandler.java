@@ -7,6 +7,7 @@ import com.foogaro.kinexis.core.processor.Processor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -48,6 +49,7 @@ public abstract class AbstractPendingMessageHandler<T> {
     protected int BATCH_SIZE = 50;
 
     @Autowired
+    @Qualifier("redisTemplate")
     private RedisTemplate<String, String> redisTemplate;
 
     private final Class<T> entityClass;

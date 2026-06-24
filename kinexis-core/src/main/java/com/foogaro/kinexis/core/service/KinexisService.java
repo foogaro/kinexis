@@ -216,6 +216,10 @@ public abstract class KinexisService<T> {
         }
     }
 
+    protected void invalidateCache(Object id) {
+        deleteFromCache(id);
+    }
+
     private Optional<T> writeToCache(T entity) {
         if (Objects.nonNull(entity)) {
             Duration ttl = cacheTtl();

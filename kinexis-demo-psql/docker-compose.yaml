@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kinexis-demo-psql-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: kinexis
+      POSTGRES_USER: kinexis
+      POSTGRES_PASSWORD: kinexis
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kinexis -d kinexis"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: kinexis-demo-psql-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20

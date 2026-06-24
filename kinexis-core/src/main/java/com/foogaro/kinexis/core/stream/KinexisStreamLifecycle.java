@@ -36,11 +36,10 @@ public class KinexisStreamLifecycle {
         }
         try {
             ensureStreamExists(streamKey);
-            redisTemplate.opsForStream().createGroup(streamKey, ReadOffset.from("0"), groupName);
+            redisTemplate.opsForStream().createGroup(streamKey, ReadOffset.latest(), groupName);
             logger.info("Consumer group {} created for stream {}", groupName, streamKey);
         } catch (RuntimeException e) {
-            String message = e.getMessage() == null ? "" : e.getMessage();
-            if (message.contains("BUSYGROUP")) {
+            if (hasMessage(e, "BUSYGROUP")) {
                 logger.debug("Consumer group {} already exists for stream {}", groupName, streamKey);
                 return;
             }
@@ -75,5 +74,17 @@ public class KinexisStreamLifecycle {
                 throw e;
             }
         }
+    }
+
+    private boolean hasMessage(Throwable throwable, String value) {
+        Throwable current = throwable;
+        while (current != null) {
+            String message = current.getMessage();
+            if (message != null && message.contains(value)) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 }

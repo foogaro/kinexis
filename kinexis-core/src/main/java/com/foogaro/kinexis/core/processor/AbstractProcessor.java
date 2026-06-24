@@ -36,6 +36,7 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
     private final Logger logger = LoggerFactory.getLogger(getClass());
 
     @Autowired
+    @Qualifier("redisTemplate")
     private RedisTemplate<String, String> redisTemplate;
 
     @Autowired
