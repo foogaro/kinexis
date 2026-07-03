@@ -4,11 +4,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.foogaro.kinexis.core.annotation.CachingPatterns;
 import com.foogaro.kinexis.core.config.KinexisProperties;
 import com.foogaro.kinexis.core.exception.AcknowledgeMessageException;
+import com.foogaro.kinexis.core.exception.KinexisBackpressureException;
 import com.foogaro.kinexis.core.exception.ProcessMessageException;
 import com.foogaro.kinexis.core.handler.AbstractPendingMessageHandler;
+import com.foogaro.kinexis.core.handler.KinexisDlqWriter;
+import com.foogaro.kinexis.core.listener.AbstractStreamListener;
 import com.foogaro.kinexis.core.model.CachingPattern;
 import com.foogaro.kinexis.core.model.KinexisEvent;
 import com.foogaro.kinexis.core.processor.AbstractProcessor;
+import com.foogaro.kinexis.core.processor.KinexisProcessingCoordinator;
+import com.foogaro.kinexis.core.processor.KinexisProcessingMetrics;
+import com.foogaro.kinexis.core.processor.KinexisStoreExecutor;
+import com.foogaro.kinexis.core.processor.Processor;
 import com.foogaro.kinexis.core.service.AnnotationFinder;
 import com.foogaro.kinexis.core.store.CacheStore;
 import com.foogaro.kinexis.core.store.BeanFinderEntityStoreRegistry;
@@ -28,6 +35,10 @@ import com.foogaro.kinexis.core.stream.RedisStreamEventPublisher;
 import com.foogaro.kinexis.core.service.KinexisService;
 import com.foogaro.kinexis.core.stream.EventPublisher;
 import com.foogaro.kinexis.core.stream.KinexisStreamLifecycle;
+import com.foogaro.kinexis.core.stream.StreamPartitioner;
+import com.foogaro.kinexis.core.telemetry.KinexisTelemetry;
+import com.foogaro.kinexis.core.telemetry.KinexisTelemetrySnapshot;
+import com.foogaro.kinexis.core.telemetry.SimpleKinexisTelemetry;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,10 +62,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.foogaro.kinexis.core.Misc.EVENT_CONTENT_KEY;
 import static com.foogaro.kinexis.core.Misc.EVENT_OPERATION_KEY;
@@ -124,6 +138,111 @@ class RedisStreamsIntegrationTest {
         assertEquals(Misc.Operation.SAVE.getValue(), records.getFirst().getValue().get(EVENT_OPERATION_KEY));
         assertEquals(KinexisEvent.CURRENT_SCHEMA_VERSION, records.getFirst().getValue().get(EVENT_SCHEMA_VERSION_KEY));
         assertEquals(TestEntity.class.getName(), records.getFirst().getValue().get(KinexisEvent.EVENT_ENTITY_TYPE_KEY));
+        assertNotNull(records.getFirst().getValue().get(KinexisEvent.EVENT_ID_KEY));
+    }
+
+    @Test
+    void telemetryRecordsPublishedProcessedStoreLatencyAndStoreFailures() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        RedisStreamEventPublisher publisher = new RedisStreamEventPublisher(
+                redisTemplate,
+                new StreamPartitioner(new KinexisProperties()),
+                telemetry);
+        TestEntity entity = new TestEntity(61L, "Telemetry");
+        KinexisEvent event = KinexisEvent.save(TestEntity.class, 61L, objectMapper.writeValueAsString(entity));
+
+        publisher.append(TestEntity.class, event);
+        List<MapRecord<String, Object, Object>> records = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(records);
+        MapRecord<String, String, String> record = convertRecord(records.getFirst());
+        inject(processor, "telemetry", telemetry);
+        processor.process(record);
+
+        KinexisTelemetrySnapshot successSnapshot = telemetry.snapshot();
+        assertEquals(1, counter(successSnapshot, KinexisTelemetry.STREAM_EVENTS_PUBLISHED, "operation", "SAVE"));
+        assertEquals(1, counter(successSnapshot, KinexisTelemetry.STREAM_EVENTS_PROCESSED, "operation", "SAVE"));
+        assertEquals(1, timerCount(successSnapshot, KinexisTelemetry.STORE_WRITE_LATENCY, "store", "backing"));
+
+        backingStore.failSaves = true;
+        MapRecord<String, String, String> failedRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                62L,
+                objectMapper.writeValueAsString(new TestEntity(62L, "Failure"))));
+
+        assertThrows(ProcessMessageException.class, () -> processor.process(failedRecord));
+        KinexisTelemetrySnapshot failureSnapshot = telemetry.snapshot();
+        assertEquals(1, counter(failureSnapshot, KinexisTelemetry.STORE_FAILURES, "exception", IllegalStateException.class.getName()));
+    }
+
+    @Test
+    void publisherRoutesSameEntityIdToSamePartitionedStream() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStream().setPartitions(4);
+        StreamPartitioner streamPartitioner = new StreamPartitioner(properties);
+        RedisStreamEventPublisher publisher = new RedisStreamEventPublisher(redisTemplate, streamPartitioner);
+        KinexisEvent firstEvent = KinexisEvent.save(TestEntity.class, 11L,
+                objectMapper.writeValueAsString(new TestEntity(11L, "Ada")));
+        KinexisEvent secondEvent = KinexisEvent.save(TestEntity.class, 11L,
+                objectMapper.writeValueAsString(new TestEntity(11L, "Lovelace")));
+
+        publisher.append(TestEntity.class, firstEvent);
+        publisher.append(TestEntity.class, secondEvent);
+
+        String partitionStream = streamPartitioner.streamKey(TestEntity.class, firstEvent);
+        assertEquals(partitionStream, streamPartitioner.streamKey(TestEntity.class, secondEvent));
+        List<MapRecord<String, Object, Object>> partitionRecords = redisTemplate.opsForStream()
+                .range(partitionStream, Range.unbounded());
+        assertNotNull(partitionRecords);
+        assertEquals(2, partitionRecords.size());
+        assertEquals(1, streamPartitioner.streamKeys(TestEntity.class).stream()
+                .map(redisTemplate.opsForStream()::size)
+                .filter(size -> size != null && size > 0)
+                .count());
+    }
+
+    @Test
+    void pendingHandlerRetriesPartitionedStreams() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStream().setPartitions(4);
+        StreamPartitioner streamPartitioner = new StreamPartitioner(properties);
+        KinexisEvent event = KinexisEvent.save(TestEntity.class, 12L,
+                objectMapper.writeValueAsString(new TestEntity(12L, "PartitionRetry")));
+        MapRecord<String, String, String> record = enqueueAndRead(event, TestEntity.class, streamPartitioner);
+        TestPendingMessageHandler handler = pendingHandler(processor, 3, streamPartitioner);
+
+        handler.processPendingMessages();
+
+        assertEquals(Optional.of(new TestEntity(12L, "PartitionRetry")), backingStore.findById(12L));
+        assertEquals(0, pendingCount(record.getStream(), TestEntity.class));
+    }
+
+    @Test
+    void dlqReplayPreservesOriginalPartitionedStream() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStream().setPartitions(4);
+        StreamPartitioner streamPartitioner = new StreamPartitioner(properties);
+        backingStore.failSaves = true;
+        KinexisEvent event = KinexisEvent.save(TestEntity.class, 13L,
+                objectMapper.writeValueAsString(new TestEntity(13L, "PartitionDlq")));
+        MapRecord<String, String, String> record = enqueueAndRead(event, TestEntity.class, streamPartitioner);
+        TestPendingMessageHandler handler = pendingHandler(processor, 1, streamPartitioner);
+        handler.processPendingMessages();
+        List<MapRecord<String, Object, Object>> dlqRecords = redisTemplate.opsForStream()
+                .range(Misc.getDLQStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(dlqRecords);
+        assertEquals(1, dlqRecords.size());
+        assertEquals(record.getStream(), dlqRecords.getFirst().getValue().get(AbstractPendingMessageHandler.DLQ_STREAM_KEY));
+
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate);
+        Optional<String> replayedId = dlqService.replay(TestEntity.class, dlqRecords.getFirst().getId().getValue());
+
+        assertTrue(replayedId.isPresent());
+        List<MapRecord<String, Object, Object>> partitionRecords = redisTemplate.opsForStream()
+                .range(record.getStream(), Range.unbounded());
+        assertNotNull(partitionRecords);
+        assertEquals(3, partitionRecords.size());
+        assertEquals(replayedId.orElseThrow(), partitionRecords.getLast().getId().getValue());
     }
 
     @Test
@@ -311,6 +430,7 @@ class RedisStreamsIntegrationTest {
     void storeValidatorReportsDuplicateStoresAmbiguousTargetsInvalidParallelismAndRepositoryDiscovery() {
         KinexisProperties properties = new KinexisProperties();
         properties.getProcessing().setMaxParallelStores(0);
+        properties.getStream().setPartitions(0);
         properties.getStores().getRepositoryDiscovery().setEnabled(true);
         InMemoryStore firstStore = new InMemoryStore("duplicate", "shared");
         InMemoryStore duplicateStore = new InMemoryStore("duplicate", "other");
@@ -329,6 +449,7 @@ class RedisStreamsIntegrationTest {
         KinexisStoreValidator.ValidationResult result = validator.validate();
 
         assertTrue(result.errors().stream().anyMatch(error -> error.contains("max-parallel-stores")));
+        assertTrue(result.errors().stream().anyMatch(error -> error.contains("stream.partitions")));
         assertTrue(result.errors().stream().anyMatch(error -> error.contains("duplicate store name 'duplicate'")));
         assertTrue(result.errors().stream().anyMatch(error -> error.contains("ambiguous target alias 'shared'")));
         assertTrue(result.warnings().stream().anyMatch(warning -> warning.contains("repository-discovery.enabled is true")));
@@ -343,6 +464,22 @@ class RedisStreamsIntegrationTest {
 
         assertThrows(IllegalArgumentException.class, () -> service.save(new WriteBehindEntity(91L, "target"), "missing"));
         assertEquals(0, publisher.appendCount);
+    }
+
+    @Test
+    void servicePublishesWriteBehindEventsWithStableEntityIdAndEventId() throws Exception {
+        WriteBehindService service = new WriteBehindService();
+        CountingEventPublisher publisher = new CountingEventPublisher();
+        EntityStoreRegistry registry = new WriteBehindRegistry(List.of(new WriteBehindStore("primaryStore", "primary")));
+        injectService(service, registry, publisher);
+
+        service.save(new WriteBehindEntity(92L, "event"), "primary");
+
+        assertEquals(1, publisher.appendCount);
+        assertNotNull(publisher.lastEvent);
+        assertNotNull(publisher.lastEvent.eventId());
+        assertEquals(Optional.of("92"), publisher.lastEvent.entityId());
+        assertEquals(List.of("primary"), publisher.lastEvent.targets());
     }
 
     @Test
@@ -394,6 +531,93 @@ class RedisStreamsIntegrationTest {
     }
 
     @Test
+    void boundedStoreExecutorRejectsWhenQueueIsFullAndRecordsMetrics() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getProcessing().getBackpressure().setQueueFullBehavior(KinexisProperties.QueueFullBehavior.REJECT_TO_DLQ);
+        KinexisProcessingMetrics metrics = new KinexisProcessingMetrics();
+        CountDownLatch release = new CountDownLatch(1);
+        KinexisStoreExecutor executor = new KinexisStoreExecutor(
+                1,
+                1,
+                properties.getProcessing().getBackpressure(),
+                metrics,
+                Thread::new);
+        try {
+            executor.execute(awaitingTask(release));
+            executor.execute(awaitingTask(release));
+
+            assertThrows(RejectedExecutionException.class, () -> executor.execute(awaitingTask(release)));
+            KinexisProcessingMetrics.Snapshot snapshot = metrics.snapshot();
+            assertEquals(2, snapshot.storeTasksSubmitted());
+            assertEquals(1, snapshot.backpressureRejections());
+            assertEquals(1, snapshot.storeExecutorQueueDepth());
+        } finally {
+            release.countDown();
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void processorRejectsWhenMaxInFlightPerStreamIsReached() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getProcessing().getBackpressure().setMaxInFlightPerStream(1);
+        properties.getProcessing().getBackpressure().setQueueFullBehavior(KinexisProperties.QueueFullBehavior.REJECT_TO_DLQ);
+        KinexisProcessingMetrics metrics = new KinexisProcessingMetrics();
+        ControlledStore store = new ControlledStore("controlledStore", 1);
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(store),
+                new EmptyEntityStoreRegistry()));
+        inject(processor, "processingMetrics", metrics);
+        inject(processor, "processingCoordinator", new KinexisProcessingCoordinator(redisTemplate, properties, metrics));
+        MapRecord<String, String, String> firstRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                51L,
+                objectMapper.writeValueAsString(new TestEntity(51L, "First"))));
+        MapRecord<String, String, String> secondRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                52L,
+                objectMapper.writeValueAsString(new TestEntity(52L, "Second"))));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            CompletableFuture<Void> first = CompletableFuture.runAsync(() -> processUnchecked(firstRecord), executor);
+            assertTrue(store.awaitEntered());
+
+            ProcessMessageException failure = assertThrows(ProcessMessageException.class, () -> processor.process(secondRecord));
+            assertTrue(hasCause(failure, KinexisBackpressureException.class));
+            assertEquals(1, metrics.snapshot().backpressureRejections());
+            store.release();
+            first.join();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void streamListenerMovesBackpressureRejectedRecordDirectlyToDlq() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getProcessing().getBackpressure().setQueueFullBehavior(KinexisProperties.QueueFullBehavior.REJECT_TO_DLQ);
+        KinexisProcessingMetrics metrics = new KinexisProcessingMetrics();
+        MapRecord<String, String, String> record = enqueueAndRead(KinexisEvent.save(
+                TestEntity.class,
+                53L,
+                objectMapper.writeValueAsString(new TestEntity(53L, "Reject"))));
+        RejectingStreamListener listener = new RejectingStreamListener(redisTemplate, objectMapper);
+        inject(listener, "properties", properties);
+        inject(listener, "dlqWriter", new KinexisDlqWriter(redisTemplate, metrics));
+
+        listener.onMessage(record);
+
+        assertEquals(0, pendingCount());
+        List<MapRecord<String, Object, Object>> dlqRecords = redisTemplate.opsForStream()
+                .range(Misc.getDLQStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(dlqRecords);
+        assertEquals(1, dlqRecords.size());
+        assertEquals("Backpressure rejected", dlqRecords.getFirst().getValue().get(AbstractPendingMessageHandler.DLQ_REASON_KEY));
+        assertEquals(1, metrics.snapshot().deadLetteredRecords());
+    }
+
+    @Test
     void serviceAppliesAnnotationTtlWhenWritingToCache() throws Exception {
         TestService service = new TestService();
         injectService(service, new TestStoreRegistry(cacheStore, backingStore), new CountingEventPublisher());
@@ -404,6 +628,22 @@ class RedisStreamsIntegrationTest {
         assertEquals(Optional.of(entity), cacheStore.findById(21L));
         assertEquals(Duration.ofSeconds(5), cacheStore.lastTtl);
         assertTrue(backingStore.findById(21L).isEmpty());
+    }
+
+    @Test
+    void serviceRecordsCacheHitsAndMisses() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        TestService service = new TestService();
+        injectService(service, new TestStoreRegistry(cacheStore, backingStore), new CountingEventPublisher());
+        inject(service, "telemetry", telemetry);
+        cacheStore.save(new TestEntity(22L, "Hit"));
+
+        assertEquals(Optional.of(new TestEntity(22L, "Hit")), service.findById(22L));
+        assertTrue(service.findById(23L).isEmpty());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.CACHE_HITS, "entity", "TestEntity"));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.CACHE_MISSES, "entity", "TestEntity"));
     }
 
     @Test
@@ -468,6 +708,109 @@ class RedisStreamsIntegrationTest {
 
             assertEquals(Optional.of(new TestEntity(12L, "Parallel")), firstStore.findById(12L));
             assertEquals(Optional.of(new TestEntity(12L, "Parallel")), secondStore.findById(12L));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void processorSkipsDuplicateEventStoreWrites() throws Exception {
+        CountingStore countingStore = new CountingStore("countingStore");
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(countingStore),
+                new EmptyEntityStoreRegistry()));
+        MapRecord<String, String, String> record = enqueueAndRead(KinexisEvent.save(
+                TestEntity.class,
+                71L,
+                objectMapper.writeValueAsString(new TestEntity(71L, "Once"))));
+
+        processor.process(record);
+        processor.process(record);
+
+        assertEquals(1, countingStore.saveCount());
+        assertEquals(Optional.of(new TestEntity(71L, "Once")), countingStore.findById(71L));
+    }
+
+    @Test
+    void processorRetriesOnlyStoresThatFailedForAnAlreadySeenEvent() throws Exception {
+        CountingStore successfulStore = new CountingStore("successfulStore");
+        CountingStore retryStore = new CountingStore("retryStore");
+        retryStore.failSaves = true;
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(successfulStore, retryStore),
+                new EmptyEntityStoreRegistry()));
+        MapRecord<String, String, String> record = enqueueAndRead(KinexisEvent.save(
+                TestEntity.class,
+                72L,
+                objectMapper.writeValueAsString(new TestEntity(72L, "Partial"))));
+
+        assertThrows(ProcessMessageException.class, () -> processor.process(record));
+        retryStore.failSaves = false;
+        processor.process(record);
+
+        assertEquals(1, successfulStore.saveCount());
+        assertEquals(1, retryStore.saveCount());
+        assertEquals(Optional.of(new TestEntity(72L, "Partial")), successfulStore.findById(72L));
+        assertEquals(Optional.of(new TestEntity(72L, "Partial")), retryStore.findById(72L));
+    }
+
+    @Test
+    void processorSerializesConcurrentRecordsForTheSameEntityId() throws Exception {
+        ControlledStore store = new ControlledStore("controlledStore", 1);
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(store),
+                new EmptyEntityStoreRegistry()));
+        MapRecord<String, String, String> firstRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                81L,
+                objectMapper.writeValueAsString(new TestEntity(81L, "First"))));
+        MapRecord<String, String, String> secondRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                81L,
+                objectMapper.writeValueAsString(new TestEntity(81L, "Second"))));
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            CompletableFuture<Void> first = CompletableFuture.runAsync(() -> processUnchecked(firstRecord), executor);
+            assertTrue(store.awaitEntered());
+            CompletableFuture<Void> second = CompletableFuture.runAsync(() -> processUnchecked(secondRecord), executor);
+            Thread.sleep(100);
+
+            assertEquals(1, store.maxConcurrent());
+            store.release();
+            first.join();
+            second.join();
+            assertEquals(1, store.maxConcurrent());
+            assertEquals(2, store.saveCount());
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void processorKeepsDifferentEntityIdsParallel() throws Exception {
+        ControlledStore store = new ControlledStore("controlledStore", 2);
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(store),
+                new EmptyEntityStoreRegistry()));
+        MapRecord<String, String, String> firstRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                82L,
+                objectMapper.writeValueAsString(new TestEntity(82L, "First"))));
+        MapRecord<String, String, String> secondRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                83L,
+                objectMapper.writeValueAsString(new TestEntity(83L, "Second"))));
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            CompletableFuture<Void> first = CompletableFuture.runAsync(() -> processUnchecked(firstRecord), executor);
+            CompletableFuture<Void> second = CompletableFuture.runAsync(() -> processUnchecked(secondRecord), executor);
+            assertTrue(store.awaitEntered());
+
+            assertEquals(2, store.maxConcurrent());
+            store.release();
+            first.join();
+            second.join();
+            assertEquals(2, store.saveCount());
         } finally {
             executor.shutdownNow();
         }
@@ -618,6 +961,30 @@ class RedisStreamsIntegrationTest {
     }
 
     @Test
+    void telemetryRecordsPendingRetryDlqAndReplayCounts() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        backingStore.failSaves = true;
+        enqueueAndRead(KinexisEvent.save(TestEntity.class, objectMapper.writeValueAsString(new TestEntity(14L, "TelemetryDlq"))));
+        TestPendingMessageHandler handler = pendingHandler(processor, 1);
+        inject(handler, "telemetry", telemetry);
+        inject(handler, "dlqWriter", new KinexisDlqWriter(redisTemplate, new KinexisProcessingMetrics(), telemetry));
+
+        handler.processPendingMessages();
+
+        List<MapRecord<String, Object, Object>> dlqRecords = redisTemplate.opsForStream()
+                .range(Misc.getDLQStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(dlqRecords);
+        assertEquals(1, dlqRecords.size());
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate, telemetry);
+        assertTrue(dlqService.replay(TestEntity.class, dlqRecords.getFirst().getId().getValue()).isPresent());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PENDING_RETRIES, "entity", "TestEntity"));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_RECORDS, "reason", "Too many attempts"));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAYS, "mode", KinexisDlqService.ReplayMode.REPLAY_ONLY.name()));
+    }
+
+    @Test
     void dlqServiceRejectsMalformedDlqRecords() {
         String dlqStreamKey = Misc.getDLQStreamKey(TestEntity.class);
         RecordId malformedId = redisTemplate.opsForStream().add(StreamRecords.newRecord()
@@ -637,6 +1004,50 @@ class RedisStreamsIntegrationTest {
         return handler;
     }
 
+    private TestPendingMessageHandler pendingHandler(TestProcessor processor, int maxAttempts,
+                                                     StreamPartitioner streamPartitioner) throws Exception {
+        TestPendingMessageHandler handler = pendingHandler(processor, maxAttempts);
+        inject(handler, "streamPartitioner", streamPartitioner);
+        return handler;
+    }
+
+    private MapRecord<String, String, String> streamRecord(KinexisEvent event) {
+        return StreamRecords.newRecord()
+                .withId(RecordId.autoGenerate())
+                .ofMap(event.toRecordMap())
+                .withStreamKey(Misc.getStreamKey(TestEntity.class));
+    }
+
+    private void processUnchecked(MapRecord<String, String, String> record) {
+        try {
+            processor.process(record);
+        } catch (ProcessMessageException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private Runnable awaitingTask(CountDownLatch release) {
+        return () -> {
+            try {
+                release.await(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while waiting for release", e);
+            }
+        };
+    }
+
+    private boolean hasCause(Throwable throwable, Class<? extends Throwable> causeType) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (causeType.isInstance(current)) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
     private MapRecord<String, String, String> enqueueAndRead(KinexisEvent event) {
         return enqueueAndRead(event, TestEntity.class);
     }
@@ -650,6 +1061,27 @@ class RedisStreamsIntegrationTest {
                 .ofMap(event.toRecordMap())
                 .withStreamKey(streamKey));
         redisTemplate.opsForStream().createGroup(streamKey, ReadOffset.from("0"), group);
+        List<MapRecord<String, Object, Object>> records = redisTemplate.opsForStream().read(
+                Consumer.from(group, consumer),
+                StreamReadOptions.empty().count(1),
+                StreamOffset.create(streamKey, ReadOffset.lastConsumed()));
+        assertNotNull(records);
+        assertEquals(1, records.size());
+        return convertRecord(records.getFirst());
+    }
+
+    private MapRecord<String, String, String> enqueueAndRead(KinexisEvent event, Class<?> consumerGroupType,
+                                                             StreamPartitioner streamPartitioner) {
+        String streamKey = streamPartitioner.streamKey(TestEntity.class, event);
+        String group = Misc.getConsumerGroup(consumerGroupType);
+        String consumer = Misc.getConsumerName(consumerGroupType);
+        KinexisStreamLifecycle lifecycle = new KinexisStreamLifecycle(redisTemplate, null);
+        streamPartitioner.streamKeys(TestEntity.class)
+                .forEach(partitionStream -> lifecycle.ensureConsumerGroup(partitionStream, group));
+        redisTemplate.opsForStream().add(StreamRecords.newRecord()
+                .withId(RecordId.autoGenerate())
+                .ofMap(event.toRecordMap())
+                .withStreamKey(streamKey));
         List<MapRecord<String, Object, Object>> records = redisTemplate.opsForStream().read(
                 Consumer.from(group, consumer),
                 StreamReadOptions.empty().count(1),
@@ -676,6 +1108,30 @@ class RedisStreamsIntegrationTest {
         PendingMessagesSummary pending = redisTemplate.opsForStream()
                 .pending(Misc.getStreamKey(TestEntity.class), Misc.getConsumerGroup(consumerGroupType));
         return pending == null ? 0 : pending.getTotalPendingMessages();
+    }
+
+    private long pendingCount(String streamKey, Class<?> consumerGroupType) {
+        PendingMessagesSummary pending = redisTemplate.opsForStream()
+                .pending(streamKey, Misc.getConsumerGroup(consumerGroupType));
+        return pending == null ? 0 : pending.getTotalPendingMessages();
+    }
+
+    private long counter(KinexisTelemetrySnapshot snapshot, String name, String tagKey, String tagValue) {
+        return snapshot.counters()
+                .stream()
+                .filter(sample -> sample.name().equals(name))
+                .filter(sample -> tagValue.equals(sample.tags().get(tagKey)))
+                .mapToLong(KinexisTelemetrySnapshot.CounterSample::count)
+                .sum();
+    }
+
+    private long timerCount(KinexisTelemetrySnapshot snapshot, String name, String tagKey, String tagValue) {
+        return snapshot.timers()
+                .stream()
+                .filter(sample -> sample.name().equals(name))
+                .filter(sample -> tagValue.equals(sample.tags().get(tagKey)))
+                .mapToLong(KinexisTelemetrySnapshot.TimerSample::count)
+                .sum();
     }
 
     private static void inject(Object target, String fieldName, Object value) throws Exception {
@@ -777,6 +1233,60 @@ class RedisStreamsIntegrationTest {
         }
     }
 
+    private static final class RejectingStreamListener extends AbstractStreamListener<TestEntity> {
+
+        private final RejectingProcessor processor;
+
+        private RejectingStreamListener(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
+            this.processor = new RejectingProcessor(redisTemplate, objectMapper);
+        }
+
+        @Override
+        public Processor<TestEntity> getProcessor() {
+            return processor;
+        }
+    }
+
+    private static final class RejectingProcessor implements Processor<TestEntity> {
+
+        private final RedisTemplate<String, String> redisTemplate;
+        private final ObjectMapper objectMapper;
+
+        private RejectingProcessor(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
+            this.redisTemplate = redisTemplate;
+            this.objectMapper = objectMapper;
+        }
+
+        @Override
+        public RedisTemplate<String, String> getRedisTemplate() {
+            return redisTemplate;
+        }
+
+        @Override
+        public ObjectMapper getObjectMapper() {
+            return objectMapper;
+        }
+
+        @Override
+        public TestEntity convertToEntity(String content) throws com.fasterxml.jackson.core.JsonProcessingException {
+            return objectMapper.readValue(content, TestEntity.class);
+        }
+
+        @Override
+        public Class<TestEntity> getEntityClass() {
+            return TestEntity.class;
+        }
+
+        @Override
+        public void process(MapRecord<String, String, String> record) throws ProcessMessageException {
+            throw new ProcessMessageException("backpressure", new KinexisBackpressureException("capacity"));
+        }
+
+        @Override
+        public void acknowledge(MapRecord<String, String, String> record) {
+        }
+    }
+
     private static final class TestService extends KinexisService<TestEntity> {
     }
 
@@ -792,10 +1302,12 @@ class RedisStreamsIntegrationTest {
     private static final class CountingEventPublisher implements EventPublisher {
 
         private int appendCount;
+        private KinexisEvent lastEvent;
 
         @Override
         public String append(Class<?> entityType, KinexisEvent event) {
             appendCount++;
+            lastEvent = event;
             return "test-record";
         }
     }
@@ -834,7 +1346,7 @@ class RedisStreamsIntegrationTest {
         private final String name;
         private final Set<String> targets;
         private final Map<Object, TestEntity> entities = new ConcurrentHashMap<>();
-        private boolean failSaves;
+        protected boolean failSaves;
 
         private InMemoryStore(String name) {
             this(name, name);
@@ -923,6 +1435,76 @@ class RedisStreamsIntegrationTest {
                 throw new IllegalStateException("Interrupted waiting for concurrent store fan-out", e);
             }
             return super.save(entity);
+        }
+    }
+
+    private static final class CountingStore extends InMemoryStore {
+
+        private final AtomicInteger saveCount = new AtomicInteger();
+
+        private CountingStore(String name) {
+            super(name);
+        }
+
+        @Override
+        public TestEntity save(TestEntity entity) {
+            TestEntity saved = super.save(entity);
+            saveCount.incrementAndGet();
+            return saved;
+        }
+
+        private int saveCount() {
+            return saveCount.get();
+        }
+    }
+
+    private static final class ControlledStore extends InMemoryStore {
+
+        private final CountDownLatch entered;
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final AtomicInteger active = new AtomicInteger();
+        private final AtomicInteger maxConcurrent = new AtomicInteger();
+        private final AtomicInteger saveCount = new AtomicInteger();
+
+        private ControlledStore(String name, int expectedEntries) {
+            super(name);
+            this.entered = new CountDownLatch(expectedEntries);
+        }
+
+        @Override
+        public TestEntity save(TestEntity entity) {
+            int current = active.incrementAndGet();
+            maxConcurrent.accumulateAndGet(current, Math::max);
+            entered.countDown();
+            try {
+                if (!release.await(2, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Timed out waiting for store release");
+                }
+                TestEntity saved = super.save(entity);
+                saveCount.incrementAndGet();
+                return saved;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted waiting for store release", e);
+            } finally {
+                active.decrementAndGet();
+            }
+        }
+
+        private boolean awaitEntered() throws InterruptedException {
+            return entered.await(2, TimeUnit.SECONDS);
+        }
+
+        private void release() {
+            release.countDown();
+        }
+
+        private int maxConcurrent() {
+            return maxConcurrent.get();
+        }
+
+        private int saveCount() {
+            return saveCount.get();
         }
     }
 

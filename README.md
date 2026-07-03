@@ -2,76 +2,132 @@
 
 # Kinexis
 
-Kinexis is a lightweight Spring Boot library for implementing cache-aside, write-behind, and refresh-ahead data flows with Redis Streams.
+Kinexis is a modular Java library for cache-aside, write-behind, and refresh-ahead data flows built around explicit store adapters and Redis Streams.
 
-The core idea is simple: application code keeps using ordinary services and repositories, while Kinexis coordinates cache reads, cache writes, durable stream events, asynchronous persistence, retry, and dead-letter recovery.
+The goal is to let application code keep using normal services and repositories while Kinexis handles cache reads, cache writes, durable stream events, asynchronous persistence, retry, dead-letter handling, replay, idempotency, ordering, backpressure, and lightweight telemetry.
 
-Kinexis is designed around explicit store adapters, not around a specific database technology. A store can be backed by JPA, MongoDB, Redis OM Spring, another Spring Data repository, or a custom implementation. The runtime works through `EntityStore<T>` and `CacheStore<T>` so the processing model stays platform-agnostic.
+Kinexis is intentionally store-agnostic. A backing store can be PostgreSQL, MySQL, SQL Server, MongoDB, Cassandra, Redis OM Spring, another Spring Data repository, an HTTP API, or a custom implementation. The runtime talks to stores through `EntityStore<T>` and `CacheStore<T>`, not through a database-specific API.
 
-## What It Does
+## Project Modules
 
-Kinexis provides:
+Kinexis is split so applications can choose the smallest dependency surface that matches their runtime.
 
-| Capability | What Kinexis does |
+| Artifact | What it contains | Main dependency surface |
+| --- | --- | --- |
+| `kinexis-api` | `@CachingPatterns`, events, store interfaces, default registries, exceptions, telemetry contracts, and `KinexisProperties`. | No compile dependencies. |
+| `kinexis-spring` | `KinexisService<T>`, annotation inspection, Spring bean discovery, Spring Data `CrudRepository` adapters, and optional Micrometer bridge. | Spring Context, Spring Data Commons, Jackson. |
+| `kinexis-redis-streams` | Redis Streams publisher, generated-listener base classes, processors, pending retry, DLQ, replay, idempotency, partitioning, backpressure, validation, diagnostics, and Spring Redis configuration. | Spring Data Redis, Lettuce, Spring Boot autoconfigure. |
+| `kinexis-redis-om` | Redis OM cache adapter and the annotation processor that generates Redis OM repositories plus entity stream components. | Redis OM Spring, JavaPoet, Kinexis Redis Streams runtime. |
+| `kinexis-core` | Backward-compatible bundle for users that want one dependency. | Depends on all modules above. |
+
+Existing imports remain stable. Even when using the split modules, public classes still live under packages such as `com.foogaro.kinexis.core.service`, `com.foogaro.kinexis.core.store`, and `com.foogaro.kinexis.core.model`.
+
+## What Kinexis Does
+
+| Capability | Behavior |
 | --- | --- |
-| Cache-aside | Reads from cache first, falls back to a primary store, then repopulates the cache. |
-| Write-behind | Publishes save/delete events to Redis Streams and persists to one or more backing stores asynchronously. |
-| Refresh-ahead | Uses Redis key expiration events to refresh cached data when TTL-based cache entries expire. |
-| Explicit store routing | Lets you register named stores and target groups such as `mysql`, `mongo`, `primary`, or `archive`. |
-| Parallel fan-out | Writes one stream event to multiple target stores concurrently through a bounded executor. |
-| Retry and DLQ | Retries pending stream records and moves exhausted failures to a dead-letter stream with structured metadata. |
-| DLQ replay | Replays dead-letter records to the original stream, optionally overriding target stores. |
-| Startup validation | Fails fast for missing stores, invalid parallelism, duplicate store names, and ambiguous target aliases. |
-| Diagnostics | Exposes resolved entity/store metadata through `KinexisDiagnosticsService`. |
+| Cache-aside | Reads from a cache store first, falls back to a primary store, then repopulates the cache. |
+| Write-behind | Publishes save/delete events to Redis Streams and persists asynchronously to target backing stores. |
+| Refresh-ahead | Uses Redis key expiration events to reload cache entries when TTL-based entries expire. |
+| Store routing | Routes write-behind events to all stores or selected target groups such as `primary`, `mysql`, or `archive`. |
+| Parallel fan-out | Invokes matching target stores concurrently through a bounded executor. |
+| Partitioned streams | Routes events by `entityId` across partitioned Redis Streams while keeping each entity on a stable partition. |
+| Per-entity ordering | Serializes records for the same entity ID inside the application instance. |
+| Idempotency | Skips a store write when the same `{eventId, storeName}` has already succeeded. |
+| Pending retry | Reprocesses pending Redis Stream records using configurable retry limits. |
+| DLQ and replay | Moves exhausted failures to a dead-letter stream and can replay records to original or selected targets. |
+| Backpressure | Bounds in-flight records and executor queue depth, with block, slow-down, or reject-to-DLQ behavior. |
+| Telemetry | Exposes dependency-light counters/timers and optionally forwards to Micrometer when a `MeterRegistry` bean exists. |
+| Validation and diagnostics | Validates store wiring at startup and exposes runtime metadata through service APIs. |
 
-Kinexis does not add an HTTP diagnostics endpoint. The library exposes a service API so applications can decide whether to wire that into Actuator, an internal controller, logs, tests, or another operational surface.
+Kinexis does not add HTTP endpoints. Diagnostics and DLQ operations are plain services so applications can expose them through Actuator, internal controllers, jobs, CLI tools, tests, or logs.
 
-## Runtime Model
+## Choosing Dependencies
 
-For an annotated entity, Kinexis generates entity-specific infrastructure at compile time:
+### Compatibility Bundle
 
-* a Redis OM repository for the cache representation
-* a Redis Stream listener
-* a stream processor
-* a pending-message handler
-* a lightweight `KinexisEntityRegistry` component
-* a key-expiration listener when refresh-ahead is enabled with a positive TTL
-
-At runtime, the flow is:
-
-1. Your application calls a method inherited from `KinexisService<T>`.
-2. Reads consult `EntityStoreRegistry` for a `CacheStore<T>` and primary `EntityStore<T>`.
-3. Write-behind saves and deletes append versioned events to Redis Streams.
-4. Generated stream listeners read those events by entity-specific consumer group.
-5. Processors resolve target stores from `EntityStoreRegistry`.
-6. Target stores are invoked concurrently up to `kinexis.processing.max-parallel-stores`.
-7. Failed processing stays pending, is retried, and eventually moves to a dead-letter stream.
-
-## Installation
-
-Add `kinexis-core` to your Spring Boot application.
+Use `kinexis-core` when you want the same one-dependency setup as earlier releases.
 
 ```xml
-    <dependency>
-        <groupId>io.github.foogaro</groupId>
-        <artifactId>kinexis-core</artifactId>
-        <version>1.1.0</version>
-    </dependency>
+<dependency>
+    <groupId>io.github.foogaro</groupId>
+    <artifactId>kinexis-core</artifactId>
+    <version>2.0.0</version>
+</dependency>
 ```
 
-Import Kinexis configuration in your Spring Boot application:
+This brings `kinexis-api`, `kinexis-spring`, `kinexis-redis-streams`, and `kinexis-redis-om`.
+
+### API Only
+
+Use `kinexis-api` if you only need annotations, event metadata, store contracts, or telemetry contracts.
+
+```xml
+<dependency>
+    <groupId>io.github.foogaro</groupId>
+    <artifactId>kinexis-api</artifactId>
+    <version>2.0.0</version>
+</dependency>
+```
+
+This module has no compile dependencies. It is the right choice for shared model jars, custom store implementations, tests, or non-Spring code that only needs the contracts.
+
+### Spring With Custom Stores
+
+Use this set when your application wants `KinexisService<T>`, explicit stores, and Redis Streams, but does not need generated Redis OM repositories.
+
+```xml
+<dependency>
+    <groupId>io.github.foogaro</groupId>
+    <artifactId>kinexis-spring</artifactId>
+    <version>2.0.0</version>
+</dependency>
+<dependency>
+    <groupId>io.github.foogaro</groupId>
+    <artifactId>kinexis-redis-streams</artifactId>
+    <version>2.0.0</version>
+</dependency>
+```
+
+### Spring With Redis OM Generation
+
+Use this set when you want the annotation processor to generate Redis OM repositories, stream listeners, processors, pending handlers, and refresh-ahead listeners.
+
+```xml
+<dependency>
+    <groupId>io.github.foogaro</groupId>
+    <artifactId>kinexis-redis-om</artifactId>
+    <version>2.0.0</version>
+</dependency>
+```
+
+`kinexis-redis-om` brings the runtime modules it needs transitively. It also contributes the annotation processor through `META-INF/services/javax.annotation.processing.Processor`.
+
+If your Maven build uses explicit annotation processor paths, add `kinexis-redis-om` there as well:
+
+```xml
+<annotationProcessorPaths>
+    <path>
+        <groupId>io.github.foogaro</groupId>
+        <artifactId>kinexis-redis-om</artifactId>
+        <version>2.0.0</version>
+    </path>
+</annotationProcessorPaths>
+```
+
+## Spring Boot Setup
+
+Import Kinexis Redis Streams configuration and enable scheduling.
 
 ```java
 import com.foogaro.kinexis.core.config.KinexisConfiguration;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Import;
-import org.springframework.data.redis.repository.configuration.EnableRedisRepositories;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 @SpringBootApplication
 @EnableScheduling
-@EnableRedisRepositories(basePackages = "com.example")
 @Import(KinexisConfiguration.class)
 public class Application {
 
@@ -81,7 +137,15 @@ public class Application {
 }
 ```
 
-Configure Redis and Kinexis:
+When using generated Redis OM repositories, also enable Redis OM repository scanning for the generated repository package or a parent package that includes it.
+
+```java
+import com.redis.om.spring.annotations.EnableRedisDocumentRepositories;
+
+@EnableRedisDocumentRepositories(basePackages = "com.example")
+```
+
+Configure Redis and Kinexis.
 
 ```properties
 spring.data.redis.host=localhost
@@ -89,22 +153,31 @@ spring.data.redis.port=6379
 
 kinexis.stream.poll-timeout=1s
 kinexis.stream.batch-size=100
+kinexis.stream.partitions=1
 kinexis.stream.listener.pending.max-attempts=3
 kinexis.stream.listener.pending.max-retention=120000
 kinexis.stream.listener.pending.batch-size=50
 kinexis.stream.listener.pending.fixed-delay=300000
 
 kinexis.processing.max-parallel-stores=4
+kinexis.processing.idempotency.enabled=true
+kinexis.processing.idempotency.retention=7d
+kinexis.processing.ordering.per-entity-enabled=true
+kinexis.processing.backpressure.max-in-flight-per-stream=0
+kinexis.processing.backpressure.executor-queue-size=1024
+kinexis.processing.backpressure.queue-full-behavior=BLOCK
+kinexis.processing.backpressure.slow-down-delay=100ms
+
 kinexis.validation.enabled=true
 kinexis.validation.fail-fast=true
 kinexis.stores.repository-discovery.enabled=false
 ```
 
-The jar includes Spring Boot configuration metadata for the `kinexis.*` namespace, so IDEs can autocomplete these properties without extra runtime dependencies.
+`kinexis-redis-streams` includes Spring Boot configuration metadata for the `kinexis.*` namespace.
 
-## Annotating An Entity
+## Annotating Entities
 
-Use `@CachingPatterns` on the entity class.
+`@CachingPatterns` is in `kinexis-api`. The annotation describes desired behavior. Runtime behavior is implemented by `KinexisService<T>` and the stream runtime.
 
 ```java
 import com.foogaro.kinexis.core.annotation.CachingPatterns;
@@ -157,20 +230,40 @@ public class Employer {
 }
 ```
 
-`@CachingPatterns` options:
+Annotation options:
 
 | Option | Meaning |
 | --- | --- |
 | `patterns` | Selects `CACHE_ASIDE`, `WRITE_BEHIND`, `REFRESH_AHEAD`, or `NONE`. |
-| `format` | Selects Redis cache format: `JSON` or `HASH`. |
-| `ttl` | TTL in seconds for cache writes. A value less than or equal to zero means no expiration. |
+| `format` | Selects generated Redis repository style: `JSON` maps to Redis OM document repositories, `HASH` maps to enhanced hash repositories. |
+| `ttl` | TTL in seconds for cache writes. Values less than or equal to zero mean no expiration. |
 | `enabled` | If `false`, `KinexisService` bypasses cache and stream behavior and delegates to the primary store. |
 
-The annotation processor expects an ID field annotated with `jakarta.persistence.Id` or `javax.persistence.Id`.
+The Redis OM annotation processor expects an ID field annotated with `jakarta.persistence.Id` or `javax.persistence.Id`. Missing ID fields fail at compile time.
+
+## Generated Code
+
+Generated code is provided by `kinexis-redis-om`. For an entity named `Employer`, generated classes are placed under an entity-specific package:
+
+```text
+com.example.entity.employer.EmployerKinexisEntityRegistry
+com.example.entity.employer.repository.EmployerRedisRepository
+com.example.entity.employer.listener.EmployerStreamListener
+com.example.entity.employer.processor.EmployerProcessor
+com.example.entity.employer.handler.EmployerPendingMessageHandler
+```
+
+When `REFRESH_AHEAD` is enabled and `ttl > 0`, Kinexis also generates:
+
+```text
+com.example.entity.employer.listener.EmployerKeyExpirationListener
+```
+
+Generated processors are entity-based. They ask `EntityStoreRegistry` for stores at runtime, so one stream event can safely fan out to several configured backing stores.
 
 ## Service API
 
-Application services extend `KinexisService<T>`.
+Application services extend `KinexisService<T>` from `kinexis-spring`.
 
 ```java
 import com.foogaro.kinexis.core.service.KinexisService;
@@ -179,9 +272,9 @@ import org.springframework.stereotype.Service;
 @Service
 public class EmployerService extends KinexisService<Employer> {
 
-    private final EmployerMysqlRepository repository;
+    private final EmployerRepository repository;
 
-    public EmployerService(EmployerMysqlRepository repository) {
+    public EmployerService(EmployerRepository repository) {
         this.repository = repository;
     }
 
@@ -199,14 +292,22 @@ Optional<Employer> found = employerService.findById(42L);
 Employer employer = new Employer();
 employer.setId(42L);
 employer.setName("Ada Lovelace");
+
 employerService.save(employer);
 employerService.update(employer);
 employerService.delete(42L);
 ```
 
-For write-behind entities, `save`, `update`, and `delete` publish stream events instead of directly calling the database. For cache-aside entities, `findById` reads from cache first and then falls back to the primary store.
+Runtime behavior depends on the annotation:
 
-Custom repository queries remain your responsibility:
+| Pattern | `findById` | `save` / `update` | `delete` |
+| --- | --- | --- | --- |
+| `CACHE_ASIDE` | Cache first, primary store fallback, then cache refill. | Writes to cache. | Deletes from cache. |
+| `WRITE_BEHIND` | Cache behavior only if combined with cache-aside or refresh-ahead. | Publishes a Redis Stream save event. | Publishes a Redis Stream delete event. |
+| `REFRESH_AHEAD` | Cache first, primary store fallback, cache refill with TTL. | Writes to cache with TTL. | Deletes from cache. |
+| `enabled = false` | Reads from primary store. | Writes to primary store. | Deletes from primary store. |
+
+Custom query methods remain your responsibility:
 
 ```java
 public Employer findByEmail(String email) {
@@ -216,17 +317,11 @@ public Employer findByEmail(String email) {
 
 ## Store Registration
 
-Kinexis resolves stores through `EntityStoreRegistry`. The standard path is to define explicit `EntityStore<T>` and `CacheStore<T>` beans.
+Kinexis resolves stores through `EntityStoreRegistry`. Prefer explicit store beans. Repository-name discovery is deprecated and disabled by default.
 
-Repository-name discovery is deprecated and disabled by default. Use it only as a migration bridge:
+### Primary Store
 
-```properties
-kinexis.stores.repository-discovery.enabled=true
-```
-
-### Primary Store With CrudRepositoryEntityStore
-
-Use `CrudRepositoryEntityStore` for a Spring Data repository that should receive durable writes.
+Use `CrudRepositoryEntityStore` from `kinexis-spring` for a Spring Data repository that should receive durable writes.
 
 ```java
 import com.foogaro.kinexis.core.service.BeanFinder;
@@ -252,9 +347,9 @@ class EmployerStores {
 }
 ```
 
-### Cache Store With RedisOmCacheStore
+### Redis OM Cache Store
 
-Use `RedisOmCacheStore` for Redis OM Spring repositories. It honors TTL by expiring the resolved Redis entity key after save.
+Use `RedisOmCacheStore` from `kinexis-redis-om` for Redis OM Spring repositories. It honors TTL by expiring the resolved Redis entity key after save.
 
 ```java
 import com.foogaro.kinexis.core.service.BeanFinder;
@@ -278,13 +373,16 @@ CacheStore<Employer> redisEmployerCache(
 }
 ```
 
-### Cache Store With CrudRepositoryCacheStore
+### Generic Spring Data Cache Store
 
-Use `CrudRepositoryCacheStore` when the cache repository is Spring Data compatible but not Redis OM specific.
+Use `CrudRepositoryCacheStore` from `kinexis-spring` when the cache repository is Spring Data compatible but not Redis OM specific.
 
 ```java
+import com.foogaro.kinexis.core.store.CacheStore;
+import com.foogaro.kinexis.core.store.CrudRepositoryCacheStore;
+
 @Bean
-CacheStore<Employer> genericCacheStore(
+CacheStore<Employer> genericEmployerCache(
         EmployerCacheRepository repository,
         BeanFinder beanFinder
 ) {
@@ -296,20 +394,31 @@ CacheStore<Employer> genericCacheStore(
 }
 ```
 
-`CrudRepositoryCacheStore` ignores TTL by default. Any `CacheStore<T>` can support TTL by overriding:
+`CrudRepositoryCacheStore` ignores TTL by default. Custom cache stores can honor TTL by overriding `save(T entity, Duration ttl)`.
 
 ```java
-default T save(T entity, Duration ttl) {
-    return save(entity);
+import java.time.Duration;
+
+public class ExpiringCacheStore implements CacheStore<Employer> {
+
+    @Override
+    public Employer save(Employer entity, Duration ttl) {
+        // Persist entity and apply ttl in your cache backend.
+        return entity;
+    }
+
+    // Implement the remaining EntityStore methods.
 }
 ```
 
-### Custom Stores
+### Custom Store
 
-Implement `EntityStore<T>` for any platform.
+Implement `EntityStore<T>` for any backend.
 
 ```java
 import com.foogaro.kinexis.core.store.EntityStore;
+import java.util.Optional;
+import java.util.Set;
 
 public class HttpEntityStore implements EntityStore<Employer> {
 
@@ -344,17 +453,18 @@ public class HttpEntityStore implements EntityStore<Employer> {
 }
 ```
 
-Implement `CacheStore<T>` when the store should be used as the cache.
+Register it as a Spring bean:
 
 ```java
-public class LocalCacheStore implements CacheStore<Employer> {
-    // same EntityStore methods, plus optional TTL support
+@Bean
+EntityStore<Employer> httpEmployerStore() {
+    return new HttpEntityStore();
 }
 ```
 
-## Targeted Writes
+## Targeted Write-Behind
 
-Write-behind events can target all backing stores or a selected group.
+Write-behind events can target all stores or selected store groups.
 
 ```java
 employerService.save(employer);              // all target stores
@@ -363,21 +473,91 @@ employerService.save(employer, "mysql");     // stores tagged mysql
 employerService.delete(42L, "archive");      // stores tagged archive
 ```
 
-`KinexisService` validates selected targets before publishing a stream event. If no configured store matches the requested target, it throws an `IllegalArgumentException` and does not append to Redis Streams.
+`KinexisService` validates selected targets before publishing. If no configured store matches the requested target, it throws `IllegalArgumentException` and does not append to Redis Streams.
 
-If an invalid event is appended directly to Redis Streams, the processor fails the message and leaves it pending for retry/DLQ handling.
+Each stream event carries:
 
-## Parallel Fan-Out
+| Field | Meaning |
+| --- | --- |
+| `eventId` | Stable logical event ID used for idempotency. |
+| `entityType` | Fully qualified entity class name. |
+| `entityId` | Entity ID when Kinexis can resolve it. |
+| `operation` | `SAVE` or `DELETE`. |
+| `content` | JSON entity payload for saves, ID value for deletes. |
+| `targets` | Optional comma-separated target aliases. |
+| `schemaVersion` | Event schema version. |
+| `timestamp` | Event creation timestamp. |
 
-One stream event can write to multiple stores. Kinexis invokes matching target stores concurrently through a bounded executor.
+## Redis Streams Runtime
+
+The Redis Streams runtime is in `kinexis-redis-streams`.
+
+Write-behind processing is at-least-once at the Redis Streams level. Kinexis adds store-level idempotency. If one target store succeeds and another fails, retry skips the successful store and only attempts unfinished stores.
+
+When `kinexis.stream.partitions > 1`, records route by `entityId` to:
+
+```text
+wb:stream:entity:<entity>:partition:<n>
+```
+
+With one partition, the stream key is:
+
+```text
+wb:stream:entity:<entity>
+```
+
+Generated listeners subscribe to all partitions for the entity consumer group. Processors also apply local per-entity ordering so records for the same `entityId` are serialized inside one application instance.
+
+## Backpressure
+
+Kinexis bounds asynchronous store fan-out so write-behind does not become unbounded work.
 
 ```properties
 kinexis.processing.max-parallel-stores=4
+kinexis.processing.backpressure.executor-queue-size=1024
+kinexis.processing.backpressure.max-in-flight-per-stream=0
+kinexis.processing.backpressure.queue-full-behavior=BLOCK
+kinexis.processing.backpressure.slow-down-delay=100ms
 ```
 
-If one or more stores fail, the processor raises `ProcessMessageException` with the failed store names. The pending-message handler records the failure metadata in the dead-letter stream when retry attempts are exhausted.
+Queue-full behavior:
 
-## Validation
+| Value | Behavior |
+| --- | --- |
+| `BLOCK` | Waits for executor queue capacity. |
+| `SLOW_DOWN` | Sleeps between capacity checks using `slow-down-delay`. |
+| `REJECT_TO_DLQ` | Rejects the record so it can be moved to the DLQ path. |
+
+`KinexisProcessingMetrics` exposes queue depth, active worker count, rejections, slowdowns, pending retries, and DLQ counts without requiring a metrics dependency.
+
+## Telemetry
+
+`KinexisTelemetry` is dependency-light and lives in `kinexis-api`. The default runtime uses `SimpleKinexisTelemetry`. If Micrometer is already present and a `MeterRegistry` bean exists, `kinexis-spring` also forwards metrics to Micrometer through reflection.
+
+Core metrics:
+
+| Metric | Type | Tags |
+| --- | --- | --- |
+| `kinexis.stream.events.published` | Counter | `entity`, `operation`, `stream` |
+| `kinexis.stream.events.processed` | Counter | `entity`, `operation`, `stream` |
+| `kinexis.store.write.latency` | Timer | `entity`, `store`, `operation` |
+| `kinexis.store.failures` | Counter | `entity`, `store`, `operation`, `exception` |
+| `kinexis.pending.retries` | Counter | `entity`, `stream`, `group` |
+| `kinexis.dlq.records` | Counter | `entity`, `stream`, `reason` |
+| `kinexis.dlq.replays` | Counter | `entity`, `stream`, `mode` |
+| `kinexis.cache.hits` | Counter | `entity` |
+| `kinexis.cache.misses` | Counter | `entity` |
+
+Read the in-memory snapshot:
+
+```java
+import com.foogaro.kinexis.core.telemetry.KinexisTelemetry;
+import com.foogaro.kinexis.core.telemetry.KinexisTelemetrySnapshot;
+
+KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+```
+
+## Validation And Diagnostics
 
 Startup validation is enabled by default.
 
@@ -389,31 +569,21 @@ kinexis.validation.fail-fast=true
 Validation checks:
 
 * `kinexis.processing.max-parallel-stores >= 1`
+* `kinexis.stream.partitions >= 1`
 * cache patterns have a configured `CacheStore`
 * cache-aside and refresh-ahead have a configured primary `EntityStore`
 * write-behind has at least one target `EntityStore`
-* disabled entities have a primary `EntityStore` for direct delegation
+* disabled entities have a primary `EntityStore`
 * store names are unique per entity
 * target aliases are not ambiguous across stores for the same entity
 
-Validation warnings:
+Validation warnings include refresh-ahead without a positive TTL and deprecated repository discovery.
 
-* `REFRESH_AHEAD` is configured without a positive TTL
-* deprecated repository discovery is enabled
-
-Entity discovery for validation comes from:
-
-* generated `KinexisEntityRegistry` components
-* explicit store beans
-* generated processors
-* `KinexisService` beans
-
-## Diagnostics
-
-Inject `KinexisDiagnosticsService` to inspect the runtime configuration.
+Inject `KinexisDiagnosticsService` to inspect runtime wiring.
 
 ```java
 import com.foogaro.kinexis.core.service.KinexisDiagnosticsService;
+import org.springframework.stereotype.Service;
 
 @Service
 public class KinexisAdminService {
@@ -430,23 +600,13 @@ public class KinexisAdminService {
 }
 ```
 
-Each `EntityDiagnostics` contains:
-
-* entity class and name
-* whether the entity is annotated
-* whether Kinexis is enabled for the entity
-* configured caching patterns
-* TTL
-* resolved cache store
-* resolved primary store
-* target stores
-* all known stores for duplicate/ambiguity checks
+Diagnostics include entity class, enabled flag, patterns, TTL, cache store, primary store, target stores, and all known stores for duplicate or ambiguity checks.
 
 ## Dead-Letter Queue And Replay
 
-Pending records are retried using Redis Stream pending-entry-list state. When a message exceeds the configured attempt limit, Kinexis writes it to a dead-letter stream with structured metadata.
+Pending records are retried using Redis Stream pending-entry-list state. When a message exceeds the configured attempt limit, Kinexis writes it to a dead-letter stream.
 
-DLQ fields include:
+DLQ records include structured metadata:
 
 * `reason`
 * `error`
@@ -487,42 +647,48 @@ kinexisDlqService.replay(
 );
 ```
 
+## Repository Discovery Migration
+
+Explicit `EntityStore<T>` and `CacheStore<T>` beans are the preferred API. Legacy repository-name discovery still exists as a migration bridge and is disabled by default.
+
+```properties
+kinexis.stores.repository-discovery.enabled=true
+```
+
+When enabled, Kinexis looks for Spring Data repositories by naming convention:
+
+| Repository name | Role |
+| --- | --- |
+| `<Entity>RedisRepository` | Cache repository. |
+| `<Entity>Repository` | Primary repository. |
+| other Spring Data repositories for the entity | Write-behind target stores. |
+
+This fallback uses generic Spring Data `CrudRepository` adapters. Register `RedisOmCacheStore` explicitly when you need true Redis TTL support.
+
 ## Configuration Reference
 
 | Property | Default | Description |
 | --- | --- | --- |
 | `kinexis.stream.poll-timeout` | `1s` | Redis Stream poll timeout. |
 | `kinexis.stream.batch-size` | `100` | Records read per stream poll. |
+| `kinexis.stream.partitions` | `1` | Number of Redis Stream partitions per entity. Values greater than one route records by `entityId`. |
 | `kinexis.stream.listener.pending.max-attempts` | `3` | Attempts before DLQ. |
 | `kinexis.stream.listener.pending.max-retention` | `120000` | Pending retention threshold in milliseconds. |
 | `kinexis.stream.listener.pending.batch-size` | `50` | Pending records inspected per scan. |
 | `kinexis.stream.listener.pending.fixed-delay` | `300000` | Scheduler delay for pending scans in milliseconds. |
 | `kinexis.processing.max-parallel-stores` | available processors, minimum 2 | Maximum concurrent target-store calls per stream record. |
+| `kinexis.processing.idempotency.enabled` | `true` | Skips target-store operations already completed for the same event/store pair. |
+| `kinexis.processing.idempotency.retention` | `7d` | Retention for Redis idempotency markers. |
+| `kinexis.processing.ordering.per-entity-enabled` | `true` | Enables local per-entity processing locks. |
+| `kinexis.processing.backpressure.max-in-flight-per-stream` | `0` | Maximum active records per Redis Stream key. Use `0` for no per-stream cap. |
+| `kinexis.processing.backpressure.executor-queue-size` | `1024` | Bounded queue size for asynchronous target-store work. |
+| `kinexis.processing.backpressure.queue-full-behavior` | `BLOCK` | Overload behavior: `BLOCK`, `SLOW_DOWN`, or `REJECT_TO_DLQ`. |
+| `kinexis.processing.backpressure.slow-down-delay` | `100ms` | Delay between capacity checks when behavior is `SLOW_DOWN`. |
 | `kinexis.validation.enabled` | `true` | Enables startup validation. |
 | `kinexis.validation.fail-fast` | `true` | Fails startup when validation errors exist. |
 | `kinexis.stores.repository-discovery.enabled` | `false` | Enables deprecated repository-name discovery. |
 
-## Generated Components
-
-For an entity named `Employer`, generated code is placed under an entity-specific package such as:
-
-```text
-com.example.entity.employer.repository.EmployerRedisRepository
-com.example.entity.employer.listener.EmployerStreamListener
-com.example.entity.employer.processor.EmployerProcessor
-com.example.entity.employer.handler.EmployerPendingMessageHandler
-com.example.entity.employer.EmployerKinexisEntityRegistry
-```
-
-Refresh-ahead with positive TTL also generates:
-
-```text
-com.example.entity.employer.listener.EmployerKeyExpirationListener
-```
-
-The generated processor is entity-based, not repository-based. It asks `EntityStoreRegistry` for stores at runtime, which is what allows one event to fan out to several backing platforms.
-
-## Testing
+## Testing The Project
 
 Run the full test suite:
 
@@ -530,20 +696,47 @@ Run the full test suite:
 ./mvnw clean test
 ```
 
-The integration tests use Testcontainers with Redis and cover stream append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, and parallel fan-out.
+Run only the compatibility bundle and its integration tests:
+
+```bash
+./mvnw -pl kinexis-core -am test
+```
+
+Run a demo module:
+
+```bash
+./mvnw -pl kinexis-demo-psql -am test
+```
+
+The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, partitioning, idempotency, telemetry, and generated-code compatibility.
+
+## Demo Projects
+
+The repository includes demo applications for common backing stores:
+
+| Module | Backing store focus |
+| --- | --- |
+| `kinexis-demo` | Combined multi-datasource demo. |
+| `kinexis-demo-psql` | PostgreSQL. |
+| `kinexis-demo-mysql` | MySQL. |
+| `kinexis-demo-mongodb` | MongoDB. |
+| `kinexis-demo-sql-server` | SQL Server. |
+| `kinexis-demo-cassandra` | Cassandra. |
 
 ## Design Notes
 
-Kinexis intentionally keeps the public runtime small:
+Kinexis keeps the API small:
 
 * `@CachingPatterns` describes desired behavior.
-* `KinexisService<T>` is the service base class used by application code.
-* `EntityStore<T>` and `CacheStore<T>` make stores explicit and platform-agnostic.
-* `EntityStoreRegistry` resolves stores for services and processors.
+* `KinexisService<T>` is the Spring service base class used by application code.
+* `EntityStore<T>` and `CacheStore<T>` keep store access explicit and platform-agnostic.
+* `EntityStoreRegistry` resolves cache, primary, and target stores.
+* `EventPublisher` abstracts event publication.
+* `KinexisTelemetry` abstracts operational metrics.
 * `KinexisDiagnosticsService` exposes runtime metadata.
 * `KinexisDlqService` handles operational replay.
 
-The library uses Redis for cache and streams, but backing stores are intentionally not Redis-specific.
+Redis is used for cache and streams, but durable backing stores are intentionally not Redis-specific.
 
 ## Disclaimer
 

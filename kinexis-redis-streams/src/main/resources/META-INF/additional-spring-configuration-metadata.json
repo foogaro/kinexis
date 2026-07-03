@@ -1,0 +1,112 @@
+{
+  "properties": [
+    {
+      "name": "kinexis.stream.poll-timeout",
+      "type": "java.time.Duration",
+      "description": "Maximum time a Redis Stream listener waits while polling for records.",
+      "defaultValue": "1s"
+    },
+    {
+      "name": "kinexis.stream.batch-size",
+      "type": "java.lang.Integer",
+      "description": "Maximum number of Redis Stream records read per poll.",
+      "defaultValue": 100
+    },
+    {
+      "name": "kinexis.stream.partitions",
+      "type": "java.lang.Integer",
+      "description": "Number of Redis Stream partitions per entity. Values greater than one route events by entity ID.",
+      "defaultValue": 1
+    },
+    {
+      "name": "kinexis.stream.listener.pending.max-attempts",
+      "type": "java.lang.Integer",
+      "description": "Maximum pending-message delivery attempts before moving a record to the dead letter stream.",
+      "defaultValue": 3
+    },
+    {
+      "name": "kinexis.stream.listener.pending.max-retention",
+      "type": "java.lang.Long",
+      "description": "Maximum pending-message retention time in milliseconds before retry/DLQ handling.",
+      "defaultValue": 120000
+    },
+    {
+      "name": "kinexis.stream.listener.pending.batch-size",
+      "type": "java.lang.Integer",
+      "description": "Maximum number of pending messages inspected per pending-message scan.",
+      "defaultValue": 50
+    },
+    {
+      "name": "kinexis.stream.listener.pending.fixed-delay",
+      "type": "java.lang.Long",
+      "description": "Fixed delay in milliseconds between scheduled pending-message scans.",
+      "defaultValue": 300000
+    },
+    {
+      "name": "kinexis.stores.repository-discovery.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Enables deprecated Spring Data repository-name discovery as a migration bridge. Explicit EntityStore and CacheStore beans are preferred.",
+      "defaultValue": false
+    },
+    {
+      "name": "kinexis.processing.max-parallel-stores",
+      "type": "java.lang.Integer",
+      "description": "Maximum number of backing stores processed concurrently for one stream record.",
+      "defaultValue": 2
+    },
+    {
+      "name": "kinexis.processing.idempotency.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Skips target-store operations that already completed for the same Kinexis event ID.",
+      "defaultValue": true
+    },
+    {
+      "name": "kinexis.processing.idempotency.retention",
+      "type": "java.time.Duration",
+      "description": "How long successful event/store idempotency markers are retained in Redis.",
+      "defaultValue": "7d"
+    },
+    {
+      "name": "kinexis.processing.ordering.per-entity-enabled",
+      "type": "java.lang.Boolean",
+      "description": "Serializes stream processing for records that target the same entity ID while allowing different entities to proceed concurrently.",
+      "defaultValue": true
+    },
+    {
+      "name": "kinexis.processing.backpressure.max-in-flight-per-stream",
+      "type": "java.lang.Integer",
+      "description": "Maximum records that may be processed concurrently for one Redis Stream key. Use 0 for no per-stream cap.",
+      "defaultValue": 0
+    },
+    {
+      "name": "kinexis.processing.backpressure.executor-queue-size",
+      "type": "java.lang.Integer",
+      "description": "Bounded queue size for asynchronous target-store work.",
+      "defaultValue": 1024
+    },
+    {
+      "name": "kinexis.processing.backpressure.queue-full-behavior",
+      "type": "com.foogaro.kinexis.core.config.KinexisProperties$QueueFullBehavior",
+      "description": "Behavior when processing capacity is exhausted: BLOCK, REJECT_TO_DLQ, or SLOW_DOWN.",
+      "defaultValue": "BLOCK"
+    },
+    {
+      "name": "kinexis.processing.backpressure.slow-down-delay",
+      "type": "java.time.Duration",
+      "description": "Delay used between capacity checks when queue-full behavior is SLOW_DOWN.",
+      "defaultValue": "100ms"
+    },
+    {
+      "name": "kinexis.validation.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Enables startup validation of Kinexis entity/store configuration.",
+      "defaultValue": true
+    },
+    {
+      "name": "kinexis.validation.fail-fast",
+      "type": "java.lang.Boolean",
+      "description": "Fails application startup when Kinexis validation finds configuration errors.",
+      "defaultValue": true
+    }
+  ]
+}

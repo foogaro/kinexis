@@ -1,0 +1,247 @@
+package com.foogaro.kinexis.core;
+
+import java.lang.annotation.Annotation;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Optional;
+
+/**
+ * Utility class providing common functionality for Redis operations and message handling.
+ * This class contains methods for generating Redis keys, stream names, consumer groups,
+ * and handling message operations. It also provides constants for message keys and
+ * separators used throughout the application.
+ */
+public class Misc {
+
+    /** Key for accessing the content of a message in a MapRecord */
+    public final static String EVENT_CONTENT_KEY = "content";
+    /** Key for accessing the operation type of a message in a MapRecord */
+    public final static String EVENT_OPERATION_KEY = "operation";
+
+    /** Separator used in Redis keys */
+    public final static String KEY_SEPARATOR = ":";
+    /** Separator used in Redis values */
+    public final static String VALUE_SEPARATOR = "_";
+
+    /** Prefix for Redis Stream keys */
+    private final static String STREAM_KEY_PREFIX = "wb:stream:entity:";
+    /** Suffix for Dead Letter Queue (DLQ) Stream keys */
+    private final static String STREAM_KEY_DLQ_SUFFIX = ":dlq";
+
+    /** Suffix for consumer group names */
+    public final static String CONSUMER_GROUP_SUFFIX = "_group";
+    /** Suffix for consumer names */
+    public final static String CONSUMER_SUFFIX = "_consumer";
+
+    /**
+     * Default constructor for Misc.
+     * This constructor is used to create instances of this utility class.
+     */
+    public Misc() {
+    }
+
+    /**
+     * Gets the entity key prefix for a given entity class.
+     * The prefix is determined by checking for Spring Data RedisHash or Redis OM Document annotations by name.
+     * If neither annotation is present, the class name in lowercase is used.
+     *
+     * @param entityClass the entity class to get the key prefix for
+     * @return the key prefix for the entity
+     */
+    public static String getEntityKeyPrefix(final Class<?> entityClass) {
+        Optional<String> redisHashValue = annotationValue(entityClass, "org.springframework.data.redis.core.RedisHash");
+        if (redisHashValue.isPresent()) {
+            return redisHashValue.get();
+        }
+
+        Optional<String> redisOmDocumentValue = annotationValue(entityClass, "com.redis.om.spring.annotations.Document");
+        if (redisOmDocumentValue.isPresent()) {
+            return redisOmDocumentValue.get();
+        }
+
+        return entityClass.getSimpleName().toLowerCase();
+    }
+
+    private static Optional<String> annotationValue(Class<?> entityClass, String annotationClassName) {
+        for (Annotation annotation : entityClass.getAnnotations()) {
+            if (!annotation.annotationType().getName().equals(annotationClassName)) {
+                continue;
+            }
+            try {
+                Object value = annotation.annotationType().getMethod("value").invoke(annotation);
+                if (value instanceof String text && !text.isBlank()) {
+                    return Optional.of(text);
+                }
+            } catch (ReflectiveOperationException ignored) {
+                return Optional.empty();
+            }
+        }
+        return Optional.empty();
+    }
+
+    public static Optional<Object> getEntityId(final Object entity) {
+        if (entity == null) {
+            return Optional.empty();
+        }
+        Class<?> entityClass = entity.getClass();
+        for (Field field : entityClass.getDeclaredFields()) {
+            if (isIdField(field)) {
+                return getFieldValue(entity, field);
+            }
+        }
+        try {
+            Field field = entityClass.getDeclaredField("id");
+            return getFieldValue(entity, field);
+        } catch (NoSuchFieldException ignored) {
+            return getIdFromMethod(entity);
+        }
+    }
+
+    public static Optional<String> getEntityKey(final Object entity) {
+        return getEntityId(entity)
+                .map(id -> getEntityKeyPrefix(entity.getClass()) + KEY_SEPARATOR + id);
+    }
+
+    private static boolean isIdField(Field field) {
+        return java.util.Arrays.stream(field.getAnnotations())
+                .map(annotation -> annotation.annotationType().getName())
+                .anyMatch(name -> name.equals("jakarta.persistence.Id")
+                        || name.equals("javax.persistence.Id")
+                        || name.equals("org.springframework.data.annotation.Id"));
+    }
+
+    private static Optional<Object> getFieldValue(Object entity, Field field) {
+        try {
+            field.setAccessible(true);
+            return Optional.ofNullable(field.get(entity));
+        } catch (IllegalAccessException e) {
+            return Optional.empty();
+        }
+    }
+
+    private static Optional<Object> getIdFromMethod(Object entity) {
+        try {
+            Method method = entity.getClass().getMethod("getId");
+            return Optional.ofNullable(method.invoke(entity));
+        } catch (ReflectiveOperationException ignored) {
+            try {
+                Method method = entity.getClass().getMethod("id");
+                return Optional.ofNullable(method.invoke(entity));
+            } catch (ReflectiveOperationException e) {
+                return Optional.empty();
+            }
+        }
+    }
+
+    /**
+     * Generates a Redis Stream key for an entity class.
+     *
+     * @param entityClass the entity class to generate the stream key for
+     * @return the stream key for the entity
+     */
+    public static String getStreamKey(final Class<?> entityClass) {
+        return STREAM_KEY_PREFIX + entityClass.getSimpleName().toLowerCase();
+    }
+
+    /**
+     * Generates a Dead Letter Queue (DLQ) Stream key for an entity class.
+     *
+     * @param entityClass the entity class to generate the DLQ stream key for
+     * @return the DLQ stream key for the entity
+     */
+    public static String getDLQStreamKey(final Class<?> entityClass) {
+        return STREAM_KEY_PREFIX + entityClass.getSimpleName().toLowerCase() + STREAM_KEY_DLQ_SUFFIX;
+    }
+
+    /**
+     * Generates a consumer group name for an entity class.
+     *
+     * @param entityClass the entity class to generate the consumer group name for
+     * @return the consumer group name
+     */
+    public static String getConsumerGroup(final Class<?> entityClass) {
+        return entityClass.getSimpleName().toLowerCase() + CONSUMER_GROUP_SUFFIX;
+    }
+
+    /**
+     * Generates a consumer name for an entity class.
+     *
+     * @param entityClass the entity class
+     * @return the consumer name
+     */
+    public static String getConsumerName(final Class<?> entityClass) {
+        return entityClass.getSimpleName().toLowerCase() + CONSUMER_SUFFIX;
+    }
+
+    /**
+     * Generates a consumer group name using the legacy repository-specific shape.
+     *
+     * @param entityClass the entity class
+     * @param repositoryClass the repository class
+     * @return the consumer group name
+     * @deprecated entity-level consumers should use {@link #getConsumerGroup(Class)}
+     */
+    @Deprecated(forRemoval = false)
+    public static String getConsumerGroup(final Class<?> entityClass, final Class<?> repositoryClass) {
+        return repositoryClass.getSimpleName().toLowerCase() + CONSUMER_GROUP_SUFFIX;
+    }
+
+    /**
+     * Generates a consumer name using the legacy repository-specific shape.
+     *
+     * @param entityClass the entity class
+     * @param repositoryClass the repository class
+     * @return the consumer name
+     * @deprecated entity-level consumers should use {@link #getConsumerName(Class)}
+     */
+    @Deprecated(forRemoval = false)
+    public static String getConsumerName(final Class<?> entityClass, final Class<?> repositoryClass) {
+        return entityClass.getSimpleName().toLowerCase() + VALUE_SEPARATOR + repositoryClass.getSimpleName().toLowerCase() + CONSUMER_SUFFIX;
+    }
+
+    /**
+     * Logs the contents of a Redis Stream message for debugging purposes.
+     * Logs the stream ID, message ID, content, and operation type.
+     *
+     * @param message the MapRecord message to dump
+     */
+    public static void dumpMessage(final Object message) {
+        // Kept for binary/source compatibility. Runtime modules perform structured logging.
+    }
+
+    /**
+     * Enum representing the possible operations that can be performed on entities.
+     * These operations are used in Redis Stream messages to indicate the type of action.
+     */
+    public enum Operation {
+        /** Save operation */
+        SAVE("SAVE"),
+        /** Delete operation */
+        DELETE("DELETE");
+
+        private final String value;
+
+        /**
+         * Creates a new Operation enum value.
+         *
+         * @param value the string representation of the operation
+         */
+        Operation(String value) {
+            this.value = value;
+        }
+
+        /**
+         * Gets the string value of the operation.
+         *
+         * @return the string value
+         */
+        public String getValue() {
+            return value;
+        }
+
+        @Override
+        public String toString() {
+            return this.value;
+        }
+    }
+}
