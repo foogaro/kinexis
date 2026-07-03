@@ -52,7 +52,7 @@ Use `kinexis-core` when you want the same one-dependency setup as earlier releas
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
 </dependency>
 ```
 
@@ -66,7 +66,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
 </dependency>
 ```
 
@@ -80,12 +80,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
 </dependency>
 ```
 
@@ -97,7 +97,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
 </dependency>
 ```
 
@@ -110,7 +110,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.0.0</version>
+        <version>2.0.1</version>
     </path>
 </annotationProcessorPaths>
 ```
@@ -705,7 +705,7 @@ Run only the compatibility bundle and its integration tests:
 Run a demo module:
 
 ```bash
-./mvnw -pl kinexis-demo-psql -am test
+./mvnw -pl demo/kinexis-demo-psql -am test
 ```
 
 The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, partitioning, idempotency, telemetry, and generated-code compatibility.
@@ -716,12 +716,12 @@ The repository includes demo applications for common backing stores:
 
 | Module | Backing store focus |
 | --- | --- |
-| `kinexis-demo` | Combined multi-datasource demo. |
-| `kinexis-demo-psql` | PostgreSQL. |
-| `kinexis-demo-mysql` | MySQL. |
-| `kinexis-demo-mongodb` | MongoDB. |
-| `kinexis-demo-sql-server` | SQL Server. |
-| `kinexis-demo-cassandra` | Cassandra. |
+| `demo/kinexis-demo` | Combined multi-datasource demo. |
+| `demo/kinexis-demo-psql` | PostgreSQL. |
+| `demo/kinexis-demo-mysql` | MySQL. |
+| `demo/kinexis-demo-mongodb` | MongoDB. |
+| `demo/kinexis-demo-sql-server` | SQL Server. |
+| `demo/kinexis-demo-cassandra` | Cassandra. |
 
 ## Design Notes
 

@@ -5,7 +5,7 @@
 
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
 
     <name>kinexis</name>
     <description>Kinexis. Implementing The Caching Patterns The Right Way. Write Once. Reflect Instantly. Rediscover Effortlessly.</description>
@@ -31,12 +31,12 @@
         <module>kinexis-redis-om</module>
         <module>kinexis-core</module>
         <!-- Demo -->
-        <module>kinexis-demo</module>
-        <module>kinexis-demo-psql</module>
-        <module>kinexis-demo-mysql</module>
-        <module>kinexis-demo-mongodb</module>
-        <module>kinexis-demo-sql-server</module>
-        <module>kinexis-demo-cassandra</module>
+        <module>demo/kinexis-demo</module>
+        <module>demo/kinexis-demo-psql</module>
+        <module>demo/kinexis-demo-mysql</module>
+        <module>demo/kinexis-demo-mongodb</module>
+        <module>demo/kinexis-demo-sql-server</module>
+        <module>demo/kinexis-demo-cassandra</module>
     </modules>
 
 </project>

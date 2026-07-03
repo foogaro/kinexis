@@ -5,7 +5,7 @@
 
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-demo</artifactId>
-    <version>2.0.0</version>
+    <version>2.0.1</version>
     <name>kinexis-demo</name>
     <description>A JPA demo for the Java library Kinexis.</description>
 
@@ -24,7 +24,7 @@
         <lombok.version>1.18.46</lombok.version>
         <redis-om.version>2.0.7</redis-om.version>
         <jackson-databind.version>2.22.0</jackson-databind.version>
-        <kinexis.version>2.0.0</kinexis.version>
+        <kinexis.version>2.0.1</kinexis.version>
         <netty.version>4.2.15.Final</netty.version>
         <testcontainers.version>1.21.4</testcontainers.version>
     </properties>

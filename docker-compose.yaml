@@ -40,7 +40,7 @@ services:
         ipv4_address: 172.32.0.3
   app:
     build:
-      context: ./kinexis-demo
+      context: ./demo/kinexis-demo
       dockerfile: Dockerfile
     image: foogaro/kinexis-demo
     container_name: app
