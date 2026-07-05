@@ -14,6 +14,7 @@ Kinexis is split so applications can choose the smallest dependency surface that
 
 | Artifact | What it contains | Main dependency surface |
 | --- | --- | --- |
+| `kinexis-bom` | Maven BOM for aligning all Kinexis split module versions. | No runtime dependencies. |
 | `kinexis-api` | `@CachingPatterns`, events, store interfaces, default registries, exceptions, telemetry contracts, and `KinexisProperties`. | No compile dependencies. |
 | `kinexis-spring` | `KinexisService<T>`, annotation inspection, Spring bean discovery, Spring Data `CrudRepository` adapters, and optional Micrometer bridge. | Spring Context, Spring Data Commons, Jackson. |
 | `kinexis-redis-streams` | Redis Streams publisher, generated-listener base classes, processors, pending retry, DLQ, replay, idempotency, partitioning, backpressure, validation, diagnostics, and Spring Redis configuration. | Spring Data Redis, Lettuce, Spring Boot autoconfigure. |
@@ -44,6 +45,37 @@ Kinexis does not add HTTP endpoints. Diagnostics and DLQ operations are plain se
 
 ## Choosing Dependencies
 
+### Maven BOM
+
+Use `kinexis-bom` to align split module versions from one place.
+
+```xml
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>io.github.foogaro</groupId>
+            <artifactId>kinexis-bom</artifactId>
+            <version>2.1.0</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+```
+
+After importing the BOM, omit versions on Kinexis dependencies:
+
+```xml
+<dependency>
+    <groupId>io.github.foogaro</groupId>
+    <artifactId>kinexis-spring</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.github.foogaro</groupId>
+    <artifactId>kinexis-redis-streams</artifactId>
+</dependency>
+```
+
 ### Compatibility Bundle
 
 Use `kinexis-core` when you want the same one-dependency setup as earlier releases.
@@ -52,7 +84,7 @@ Use `kinexis-core` when you want the same one-dependency setup as earlier releas
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.0.1</version>
+    <version>2.1.0</version>
 </dependency>
 ```
 
@@ -66,7 +98,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.0.1</version>
+    <version>2.1.0</version>
 </dependency>
 ```
 
@@ -80,12 +112,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.0.1</version>
+    <version>2.1.0</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.0.1</version>
+    <version>2.1.0</version>
 </dependency>
 ```
 
@@ -97,7 +129,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.0.1</version>
+    <version>2.1.0</version>
 </dependency>
 ```
 
@@ -110,7 +142,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.0.1</version>
+        <version>2.1.0</version>
     </path>
 </annotationProcessorPaths>
 ```
