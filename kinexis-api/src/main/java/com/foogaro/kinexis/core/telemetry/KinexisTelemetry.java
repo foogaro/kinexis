@@ -12,12 +12,25 @@ public interface KinexisTelemetry {
     String PENDING_RETRIES = "kinexis.pending.retries";
     String DLQ_RECORDS = "kinexis.dlq.records";
     String DLQ_REPLAYS = "kinexis.dlq.replays";
+    String DLQ_REPLAY_FAILURES = "kinexis.dlq.replay.failures";
     String CACHE_HITS = "kinexis.cache.hits";
     String CACHE_MISSES = "kinexis.cache.misses";
+    String PROCESSING_STORE_TASKS_SUBMITTED = "kinexis.processing.store.tasks.submitted";
+    String PROCESSING_STORE_TASKS_COMPLETED = "kinexis.processing.store.tasks.completed";
+    String PROCESSING_STORE_TASKS_FAILED = "kinexis.processing.store.tasks.failed";
+    String PROCESSING_BACKPRESSURE_REJECTIONS = "kinexis.processing.backpressure.rejections";
+    String PROCESSING_BACKPRESSURE_SLOWDOWNS = "kinexis.processing.backpressure.slowdowns";
+    String PROCESSING_PENDING_RETRIES = "kinexis.processing.pending.retries";
+    String PROCESSING_DEAD_LETTERED_RECORDS = "kinexis.processing.deadletter.records";
+    String PROCESSING_STORE_EXECUTOR_QUEUE_DEPTH = "kinexis.processing.store.executor.queue.depth";
+    String PROCESSING_STORE_EXECUTOR_ACTIVE_WORKERS = "kinexis.processing.store.executor.active.workers";
 
     void increment(String name, Map<String, String> tags);
 
     void recordDuration(String name, Duration duration, Map<String, String> tags);
+
+    default void recordGauge(String name, long value, Map<String, String> tags) {
+    }
 
     default KinexisTelemetrySnapshot snapshot() {
         return KinexisTelemetrySnapshot.empty();

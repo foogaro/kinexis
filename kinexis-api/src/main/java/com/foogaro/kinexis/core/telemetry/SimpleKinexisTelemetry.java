@@ -14,6 +14,7 @@ public class SimpleKinexisTelemetry implements KinexisTelemetry {
 
     private final ConcurrentMap<MetricKey, LongAdder> counters = new ConcurrentHashMap<>();
     private final ConcurrentMap<MetricKey, TimerState> timers = new ConcurrentHashMap<>();
+    private final ConcurrentMap<MetricKey, AtomicLong> gauges = new ConcurrentHashMap<>();
 
     @Override
     public void increment(String name, Map<String, String> tags) {
@@ -27,6 +28,12 @@ public class SimpleKinexisTelemetry implements KinexisTelemetry {
         }
         timers.computeIfAbsent(MetricKey.of(name, tags), ignored -> new TimerState())
                 .record(duration.toNanos());
+    }
+
+    @Override
+    public void recordGauge(String name, long value, Map<String, String> tags) {
+        gauges.computeIfAbsent(MetricKey.of(name, tags), ignored -> new AtomicLong())
+                .set(value);
     }
 
     @Override
@@ -48,7 +55,13 @@ public class SimpleKinexisTelemetry implements KinexisTelemetry {
         timerSamples.sort(Comparator.comparing(KinexisTelemetrySnapshot.TimerSample::name)
                 .thenComparing(sample -> sample.tags().toString()));
 
-        return new KinexisTelemetrySnapshot(counterSamples, timerSamples);
+        ArrayList<KinexisTelemetrySnapshot.GaugeSample> gaugeSamples = new ArrayList<>();
+        gauges.forEach((key, value) -> gaugeSamples.add(
+                new KinexisTelemetrySnapshot.GaugeSample(key.name(), key.tags(), value.get())));
+        gaugeSamples.sort(Comparator.comparing(KinexisTelemetrySnapshot.GaugeSample::name)
+                .thenComparing(sample -> sample.tags().toString()));
+
+        return new KinexisTelemetrySnapshot(counterSamples, timerSamples, gaugeSamples);
     }
 
     private record MetricKey(String name, Map<String, String> tags) {

@@ -55,7 +55,7 @@ Use `kinexis-bom` to align split module versions from one place.
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.2.0</version>
+            <version>2.2.1</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -84,7 +84,7 @@ Use `kinexis-core` when you want the same one-dependency setup as earlier releas
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.2.0</version>
+    <version>2.2.1</version>
 </dependency>
 ```
 
@@ -98,7 +98,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.2.0</version>
+    <version>2.2.1</version>
 </dependency>
 ```
 
@@ -112,12 +112,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.2.0</version>
+    <version>2.2.1</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.2.0</version>
+    <version>2.2.1</version>
 </dependency>
 ```
 
@@ -129,7 +129,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.2.0</version>
+    <version>2.2.1</version>
 </dependency>
 ```
 
@@ -142,7 +142,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.2.0</version>
+        <version>2.2.1</version>
     </path>
 </annotationProcessorPaths>
 ```
@@ -575,10 +575,23 @@ Core metrics:
 | `kinexis.store.write.latency` | Timer | `entity`, `store`, `operation` |
 | `kinexis.store.failures` | Counter | `entity`, `store`, `operation`, `exception` |
 | `kinexis.pending.retries` | Counter | `entity`, `stream`, `group` |
-| `kinexis.dlq.records` | Counter | `entity`, `stream`, `reason` |
-| `kinexis.dlq.replays` | Counter | `entity`, `stream`, `mode` |
+| `kinexis.dlq.records` | Counter | `entity`, `stream`, `reason`, `failedStore` |
+| `kinexis.dlq.replays` | Counter | `entity`, `stream`, `mode`, `failedStore`, `targets`, `eventIdMode` |
+| `kinexis.dlq.replay.failures` | Counter | `entity`, `stream`, `mode`, `failedStore`, `targets`, `eventIdMode`, `reason` |
 | `kinexis.cache.hits` | Counter | `entity` |
 | `kinexis.cache.misses` | Counter | `entity` |
+| `kinexis.processing.store.tasks.submitted` | Counter | none |
+| `kinexis.processing.store.tasks.completed` | Counter | none |
+| `kinexis.processing.store.tasks.failed` | Counter | none |
+| `kinexis.processing.backpressure.rejections` | Counter | none |
+| `kinexis.processing.backpressure.slowdowns` | Counter | none |
+| `kinexis.processing.pending.retries` | Counter | none |
+| `kinexis.processing.deadletter.records` | Counter | none |
+| `kinexis.processing.store.executor.queue.depth` | Gauge | none |
+| `kinexis.processing.store.executor.active.workers` | Gauge | none |
+
+`eventIdMode` is `preserved` for normal replay and `new` for `replayWithNewEventId(...)`.
+`KinexisProcessingMetrics` still exposes a local snapshot for diagnostics, and the Spring runtime now bridges its counters and executor gauges into `KinexisTelemetry`.
 
 Read the in-memory snapshot:
 

@@ -23,10 +23,15 @@ public class CompositeKinexisTelemetry implements KinexisTelemetry {
     }
 
     @Override
+    public void recordGauge(String name, long value, Map<String, String> tags) {
+        delegates.forEach(delegate -> delegate.recordGauge(name, value, tags));
+    }
+
+    @Override
     public KinexisTelemetrySnapshot snapshot() {
         return delegates.stream()
                 .map(KinexisTelemetry::snapshot)
-                .filter(snapshot -> !snapshot.counters().isEmpty() || !snapshot.timers().isEmpty())
+                .filter(snapshot -> !snapshot.counters().isEmpty() || !snapshot.timers().isEmpty() || !snapshot.gauges().isEmpty())
                 .findFirst()
                 .orElseGet(KinexisTelemetrySnapshot::empty);
     }

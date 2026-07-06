@@ -1080,11 +1080,13 @@ class RedisStreamsIntegrationTest {
     @Test
     void telemetryRecordsPendingRetryDlqAndReplayCounts() throws Exception {
         SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisProcessingMetrics processingMetrics = new KinexisProcessingMetrics(telemetry);
         backingStore.failSaves = true;
         enqueueAndRead(KinexisEvent.save(TestEntity.class, objectMapper.writeValueAsString(new TestEntity(14L, "TelemetryDlq"))));
         TestPendingMessageHandler handler = pendingHandler(processor, 1);
         inject(handler, "telemetry", telemetry);
-        inject(handler, "dlqWriter", new KinexisDlqWriter(redisTemplate, new KinexisProcessingMetrics(), telemetry));
+        inject(handler, "processingMetrics", processingMetrics);
+        inject(handler, "dlqWriter", new KinexisDlqWriter(redisTemplate, processingMetrics, telemetry));
 
         handler.processPendingMessages();
 
@@ -1098,20 +1100,55 @@ class RedisStreamsIntegrationTest {
         KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
         assertEquals(1, counter(snapshot, KinexisTelemetry.PENDING_RETRIES, "entity", "TestEntity"));
         assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_RECORDS, "reason", "Too many attempts"));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_RECORDS, "failedStore", "backing"));
         assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAYS, "mode", KinexisDlqService.ReplayMode.REPLAY_ONLY.name()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAYS, "failedStore", "backing"));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAYS, "targets", "backing"));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAYS, "eventIdMode", "preserved"));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PROCESSING_PENDING_RETRIES, Map.of()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PROCESSING_DEAD_LETTERED_RECORDS, Map.of()));
     }
 
     @Test
     void dlqServiceRejectsMalformedDlqRecords() {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
         String dlqStreamKey = Misc.getDLQStreamKey(TestEntity.class);
         RecordId malformedId = redisTemplate.opsForStream().add(StreamRecords.newRecord()
                 .withId(RecordId.autoGenerate())
                 .ofMap(Map.of(AbstractPendingMessageHandler.DLQ_REASON_KEY, "manual"))
                 .withStreamKey(dlqStreamKey));
         assertNotNull(malformedId);
-        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate);
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate, telemetry);
 
         assertThrows(IllegalArgumentException.class, () -> dlqService.replay(TestEntity.class, malformedId.getValue()));
+        assertTrue(dlqService.replay(TestEntity.class, "0-0").isEmpty());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAY_FAILURES, "reason", IllegalArgumentException.class.getName()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAY_FAILURES, "reason", "notFound"));
+        assertEquals(2, counter(snapshot, KinexisTelemetry.DLQ_REPLAY_FAILURES, "eventIdMode", "preserved"));
+    }
+
+    @Test
+    void processingMetricsBridgeToTelemetryCountersAndGauges() {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisProcessingMetrics metrics = new KinexisProcessingMetrics(telemetry);
+
+        metrics.recordStoreTaskSubmitted();
+        metrics.recordStoreTaskCompleted();
+        metrics.recordStoreTaskFailed();
+        metrics.recordBackpressureRejection();
+        metrics.recordBackpressureSlowdown();
+        metrics.updateStoreExecutor(7, 2);
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PROCESSING_STORE_TASKS_SUBMITTED, Map.of()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PROCESSING_STORE_TASKS_COMPLETED, Map.of()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PROCESSING_STORE_TASKS_FAILED, Map.of()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PROCESSING_BACKPRESSURE_REJECTIONS, Map.of()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.PROCESSING_BACKPRESSURE_SLOWDOWNS, Map.of()));
+        assertEquals(7, gauge(snapshot, KinexisTelemetry.PROCESSING_STORE_EXECUTOR_QUEUE_DEPTH, Map.of()));
+        assertEquals(2, gauge(snapshot, KinexisTelemetry.PROCESSING_STORE_EXECUTOR_ACTIVE_WORKERS, Map.of()));
     }
 
     private TestPendingMessageHandler pendingHandler(TestProcessor processor, int maxAttempts) throws Exception {
@@ -1250,6 +1287,15 @@ class RedisStreamsIntegrationTest {
                 .sum();
     }
 
+    private long counter(KinexisTelemetrySnapshot snapshot, String name, Map<String, String> tags) {
+        return snapshot.counters()
+                .stream()
+                .filter(sample -> sample.name().equals(name))
+                .filter(sample -> sample.tags().entrySet().containsAll(tags.entrySet()))
+                .mapToLong(KinexisTelemetrySnapshot.CounterSample::count)
+                .sum();
+    }
+
     private long timerCount(KinexisTelemetrySnapshot snapshot, String name, String tagKey, String tagValue) {
         return snapshot.timers()
                 .stream()
@@ -1257,6 +1303,16 @@ class RedisStreamsIntegrationTest {
                 .filter(sample -> tagValue.equals(sample.tags().get(tagKey)))
                 .mapToLong(KinexisTelemetrySnapshot.TimerSample::count)
                 .sum();
+    }
+
+    private long gauge(KinexisTelemetrySnapshot snapshot, String name, Map<String, String> tags) {
+        return snapshot.gauges()
+                .stream()
+                .filter(sample -> sample.name().equals(name))
+                .filter(sample -> sample.tags().entrySet().containsAll(tags.entrySet()))
+                .mapToLong(KinexisTelemetrySnapshot.GaugeSample::value)
+                .findFirst()
+                .orElse(0L);
     }
 
     private static void inject(Object target, String fieldName, Object value) throws Exception {

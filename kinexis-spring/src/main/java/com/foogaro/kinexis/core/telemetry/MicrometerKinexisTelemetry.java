@@ -4,12 +4,19 @@ import org.springframework.beans.factory.ListableBeanFactory;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class MicrometerKinexisTelemetry implements KinexisTelemetry {
 
     private final Object meterRegistry;
+    private final ConcurrentMap<MetricKey, AtomicLong> gauges = new ConcurrentHashMap<>();
 
     public MicrometerKinexisTelemetry(Object meterRegistry) {
         this.meterRegistry = meterRegistry;
@@ -54,6 +61,24 @@ public class MicrometerKinexisTelemetry implements KinexisTelemetry {
         }
     }
 
+    @Override
+    public void recordGauge(String name, long value, Map<String, String> tags) {
+        AtomicLong gauge = gauges.computeIfAbsent(MetricKey.of(name, tags), key -> {
+            AtomicLong number = new AtomicLong(value);
+            registerGauge(key, number);
+            return number;
+        });
+        gauge.set(value);
+    }
+
+    private void registerGauge(MetricKey key, AtomicLong number) {
+        try {
+            Method gauge = meterRegistry.getClass().getMethod("gauge", String.class, Iterable.class, Number.class);
+            gauge.invoke(meterRegistry, key.name(), toTagList(key.tags()), number);
+        } catch (ReflectiveOperationException ignored) {
+        }
+    }
+
     private String[] toTagArray(Map<String, String> tags) {
         Map<String, String> safeTags = tags == null ? Map.of() : tags;
         String[] values = new String[safeTags.size() * 2];
@@ -63,5 +88,22 @@ public class MicrometerKinexisTelemetry implements KinexisTelemetry {
             values[index++] = entry.getValue();
         }
         return values;
+    }
+
+    private Iterable<?> toTagList(Map<String, String> tags) throws ReflectiveOperationException {
+        Class<?> tagClass = Class.forName("io.micrometer.core.instrument.Tag");
+        Method of = tagClass.getMethod("of", String.class, String.class);
+        List<Object> values = new ArrayList<>();
+        for (Map.Entry<String, String> entry : (tags == null ? Map.<String, String>of() : tags).entrySet()) {
+            values.add(of.invoke(null, entry.getKey(), entry.getValue()));
+        }
+        return values;
+    }
+
+    private record MetricKey(String name, Map<String, String> tags) {
+
+        private static MetricKey of(String name, Map<String, String> tags) {
+            return new MetricKey(name, new TreeMap<>(tags == null ? Map.of() : tags));
+        }
     }
 }

@@ -230,8 +230,8 @@ public class KinexisConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public KinexisProcessingMetrics kinexisProcessingMetrics() {
-        return new KinexisProcessingMetrics();
+    public KinexisProcessingMetrics kinexisProcessingMetrics(KinexisTelemetry telemetry) {
+        return new KinexisProcessingMetrics(telemetry);
     }
 
     @Bean

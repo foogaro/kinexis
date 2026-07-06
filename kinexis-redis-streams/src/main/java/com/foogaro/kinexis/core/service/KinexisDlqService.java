@@ -86,14 +86,14 @@ public class KinexisDlqService {
     }
 
     public Optional<String> replayFailedStore(Class<?> entityType, String dlqRecordId, ReplayMode replayMode) {
-        return findRecord(entityType, dlqRecordId)
-                .flatMap(record -> {
-                    String failedStore = value(record, DLQ_FAILED_STORE_KEY);
-                    if (failedStore == null || failedStore.isBlank()) {
-                        return Optional.ofNullable(replayRecord(getDLQStreamKey(entityType), entityType, record, replayMode, false));
-                    }
-                    return Optional.ofNullable(replayRecord(getDLQStreamKey(entityType), entityType, record, replayMode, false, failedStore));
-                });
+        Optional<MapRecord<String, Object, Object>> record = findRecord(entityType, dlqRecordId);
+        if (record.isEmpty()) {
+            recordReplayFailure(entityType, null, replayMode, false, "notFound");
+            return Optional.empty();
+        }
+        String failedStore = value(record.get(), DLQ_FAILED_STORE_KEY);
+        String[] targets = failedStore == null || failedStore.isBlank() ? new String[0] : new String[]{failedStore};
+        return replayRecordSafely(getDLQStreamKey(entityType), entityType, record.get(), replayMode, false, targets);
     }
 
     public List<String> replayAllFailedStores(Class<?> entityType) {
@@ -157,8 +157,26 @@ public class KinexisDlqService {
 
     private Optional<String> replay(Class<?> entityType, String dlqRecordId, ReplayMode replayMode, boolean newEventId, String... targets) {
         String dlqStreamKey = getDLQStreamKey(entityType);
-        return findRecord(entityType, dlqRecordId)
-                .map(record -> replayRecord(dlqStreamKey, entityType, record, replayMode, newEventId, targets));
+        Optional<MapRecord<String, Object, Object>> record = findRecord(entityType, dlqRecordId);
+        if (record.isEmpty()) {
+            recordReplayFailure(entityType, null, replayMode, newEventId, "notFound", targets);
+            return Optional.empty();
+        }
+        return replayRecordSafely(dlqStreamKey, entityType, record.get(), replayMode, newEventId, targets);
+    }
+
+    private Optional<String> replayRecordSafely(String dlqStreamKey,
+                                                Class<?> entityType,
+                                                MapRecord<String, Object, Object> record,
+                                                ReplayMode replayMode,
+                                                boolean newEventId,
+                                                String... targets) {
+        try {
+            return Optional.ofNullable(replayRecord(dlqStreamKey, entityType, record, replayMode, newEventId, targets));
+        } catch (RuntimeException e) {
+            recordReplayFailure(entityType, record, replayMode, newEventId, e.getClass().getName(), targets);
+            throw e;
+        }
     }
 
     private String replayRecord(String dlqStreamKey, Class<?> entityType, MapRecord<String, Object, Object> record,
@@ -182,13 +200,51 @@ public class KinexisDlqService {
         if (replayedId != null && replayMode == ReplayMode.REPLAY_AND_DELETE) {
             redisTemplate.opsForStream().delete(dlqStreamKey, record.getId());
         }
-        if (replayedId != null) {
-            telemetry.increment(KinexisTelemetry.DLQ_REPLAYS, Map.of(
-                    "entity", entityType.getSimpleName(),
-                    "stream", targetStream,
-                    "mode", replayMode.name()));
+        if (replayedId == null) {
+            recordReplayFailure(entityType, record, replayMode, newEventId, "appendReturnedNull", targets);
+            return null;
         }
-        return replayedId == null ? null : replayedId.getValue();
+        telemetry.increment(KinexisTelemetry.DLQ_REPLAYS, replayTags(entityType, targetStream, record, replayMode, newEventId, replayMessage.get(EVENT_TARGETS_KEY)));
+        return replayedId.getValue();
+    }
+
+    private void recordReplayFailure(Class<?> entityType,
+                                     MapRecord<String, Object, Object> record,
+                                     ReplayMode replayMode,
+                                     boolean newEventId,
+                                     String reason,
+                                     String... targets) {
+        String targetStream = record == null || record.getValue().get(DLQ_STREAM_KEY) == null
+                ? getStreamKey(entityType)
+                : String.valueOf(record.getValue().get(DLQ_STREAM_KEY));
+        String targetValue = targets != null && targets.length > 0 ? String.join(",", targets) : recordTargets(record);
+        Map<String, String> tags = replayTags(entityType, targetStream, record, replayMode, newEventId, targetValue);
+        tags.put("reason", reason == null ? "" : reason);
+        telemetry.increment(KinexisTelemetry.DLQ_REPLAY_FAILURES, tags);
+    }
+
+    private Map<String, String> replayTags(Class<?> entityType,
+                                           String targetStream,
+                                           MapRecord<String, Object, Object> record,
+                                           ReplayMode replayMode,
+                                           boolean newEventId,
+                                           String targets) {
+        Map<String, String> tags = new HashMap<>();
+        tags.put("entity", entityType.getSimpleName());
+        tags.put("stream", targetStream == null ? "" : targetStream);
+        tags.put("mode", replayMode.name());
+        tags.put("failedStore", record == null ? "" : Optional.ofNullable(value(record, DLQ_FAILED_STORE_KEY)).orElse(""));
+        tags.put("targets", targets == null ? "" : targets);
+        tags.put("eventIdMode", newEventId ? "new" : "preserved");
+        return tags;
+    }
+
+    private String recordTargets(MapRecord<String, Object, Object> record) {
+        if (record == null) {
+            return "";
+        }
+        Object value = record.getValue().get(EVENT_TARGETS_KEY);
+        return value == null ? "" : String.valueOf(value);
     }
 
     private Optional<MapRecord<String, Object, Object>> findRecord(Class<?> entityType, String dlqRecordId) {
