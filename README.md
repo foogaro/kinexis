@@ -36,7 +36,7 @@ Existing imports remain stable. Even when using the split modules, public classe
 | Per-entity ordering | Serializes records for the same entity ID inside the application instance. |
 | Idempotency | Skips a store write when the same `{eventId, storeName}` has already succeeded. |
 | Pending retry | Reprocesses pending Redis Stream records using configurable retry limits. |
-| DLQ and replay | Moves exhausted failures to a dead-letter stream and can replay records to original or selected targets. |
+| Per-store DLQ and replay | Moves exhausted failures to a dead-letter stream per failed store, lists records through a typed DTO, and replays all records, one store, or one failed-store record. |
 | Backpressure | Bounds in-flight records and executor queue depth, with block, slow-down, or reject-to-DLQ behavior. |
 | Telemetry | Exposes dependency-light counters/timers and optionally forwards to Micrometer when a `MeterRegistry` bean exists. |
 | Validation and diagnostics | Validates store wiring at startup and exposes runtime metadata through service APIs. |
@@ -55,7 +55,7 @@ Use `kinexis-bom` to align split module versions from one place.
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.1.0</version>
+            <version>2.2.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -84,7 +84,7 @@ Use `kinexis-core` when you want the same one-dependency setup as earlier releas
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.1.0</version>
+    <version>2.2.0</version>
 </dependency>
 ```
 
@@ -98,7 +98,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.1.0</version>
+    <version>2.2.0</version>
 </dependency>
 ```
 
@@ -112,12 +112,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.1.0</version>
+    <version>2.2.0</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.1.0</version>
+    <version>2.2.0</version>
 </dependency>
 ```
 
@@ -129,7 +129,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.1.0</version>
+    <version>2.2.0</version>
 </dependency>
 ```
 
@@ -142,7 +142,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.1.0</version>
+        <version>2.2.0</version>
     </path>
 </annotationProcessorPaths>
 ```
@@ -636,47 +636,120 @@ Diagnostics include entity class, enabled flag, patterns, TTL, cache store, prim
 
 ## Dead-Letter Queue And Replay
 
-Pending records are retried using Redis Stream pending-entry-list state. When a message exceeds the configured attempt limit, Kinexis writes it to a dead-letter stream.
+Pending records are retried using Redis Stream pending-entry-list state. When a message exceeds the configured attempt limit, Kinexis writes it to a Redis Stream dead-letter queue.
 
-DLQ records include structured metadata:
+DLQ behavior is store-aware. If a write-behind event targets PostgreSQL, MySQL, MongoDB, and SQL Server, and only MySQL and SQL Server keep failing after retries, Kinexis writes one DLQ record for MySQL and one DLQ record for SQL Server. Stores that already succeeded are protected by store-level idempotency and are not written again during normal replay.
 
-* `reason`
-* `error`
-* `attempts`
-* `failedStore`
-* `exceptionClass`
-* `failureTimestamp`
-* original stream key
-* original stream ID
-* original consumer group
-* original consumer
-
-Replay a dead-letter record:
+DLQ records are exposed as `KinexisDlqRecord` instead of raw maps:
 
 ```java
+import com.foogaro.kinexis.core.model.KinexisDlqRecord;
+
+import java.time.Instant;
+import java.util.List;
+
+public record KinexisDlqRecord(
+        String recordId,
+        String eventId,
+        String entityType,
+        String entityId,
+        String operation,
+        String failedStore,
+        int attempts,
+        String reason,
+        String exceptionClass,
+        Instant failureTimestamp,
+        List<String> targets) {
+}
+```
+
+The DTO includes the DLQ Redis Stream record ID, the original logical `eventId`, entity metadata, operation, failed store, attempt count, reason, exception class, failure timestamp, and replay targets.
+
+List and query DLQ records:
+
+```java
+import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.service.KinexisDlqService;
 
+import java.time.Duration;
+import java.util.List;
+
+List<KinexisDlqRecord> all = kinexisDlqService.list(Employer.class);
+
+List<KinexisDlqRecord> mysqlFailures =
+        kinexisDlqService.listByFailedStore(Employer.class, "mysql");
+
+List<KinexisDlqRecord> saveFailures =
+        kinexisDlqService.listByOperation(Employer.class, "SAVE");
+
+List<KinexisDlqRecord> oldFailures =
+        kinexisDlqService.listOlderThan(Employer.class, Duration.ofMinutes(30));
+
+List<KinexisDlqRecord> oldMysqlSaveFailures =
+        kinexisDlqService.list(
+                Employer.class,
+                "mysql",
+                "SAVE",
+                Duration.ofMinutes(30)
+        );
+```
+
+Replay a known DLQ record. Normal replay preserves the original `eventId`, so idempotency can skip stores that already completed that event:
+
+```java
 Optional<String> replayedId = kinexisDlqService.replay(
         Employer.class,
         dlqRecordId
 );
 ```
 
-Replay to selected targets:
+Replay only the store that failed for a known DLQ record:
 
 ```java
-kinexisDlqService.replay(Employer.class, dlqRecordId, "mysql", "primary");
+Optional<String> replayedId = kinexisDlqService.replayFailedStore(
+        Employer.class,
+        dlqRecordId
+);
+```
+
+Replay every DLQ record for a failed store:
+
+```java
+List<String> replayedIds = kinexisDlqService.replayByStore(
+        Employer.class,
+        "mysql"
+);
+```
+
+Replay all failed-store records for an entity type:
+
+```java
+List<String> replayedIds = kinexisDlqService.replayAllFailedStores(Employer.class);
 ```
 
 Replay and delete the DLQ record after successful append:
 
 ```java
-kinexisDlqService.replay(
+kinexisDlqService.replayFailedStore(
         Employer.class,
         dlqRecordId,
-        KinexisDlqService.ReplayMode.REPLAY_AND_DELETE,
-        "mysql"
+        KinexisDlqService.ReplayMode.REPLAY_AND_DELETE
 );
+```
+
+Force a replay with a new logical event ID only when you explicitly want every matching target store to treat the replay as new work:
+
+```java
+Optional<String> replayedId = kinexisDlqService.replayWithNewEventId(
+        Employer.class,
+        dlqRecordId
+);
+```
+
+You can still replay to explicitly selected targets when needed:
+
+```java
+kinexisDlqService.replay(Employer.class, dlqRecordId, "mysql", "primary");
 ```
 
 ## Repository Discovery Migration

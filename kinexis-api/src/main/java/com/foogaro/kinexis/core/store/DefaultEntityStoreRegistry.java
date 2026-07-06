@@ -56,9 +56,13 @@ public class DefaultEntityStoreRegistry implements EntityStoreRegistry {
         List<EntityStore<T>> explicit = explicitStores.stream()
                 .filter(store -> store.entityType().equals(entityType))
                 .filter(store -> !(store instanceof CacheStore<?>))
-                .filter(store -> store.targets().stream().anyMatch(targets::contains))
+                .filter(store -> matchesTarget(store, targets))
                 .map(store -> (EntityStore<T>) store)
                 .toList();
         return explicit.isEmpty() ? fallbackRegistry.findTargetStores(entityType, targets) : explicit;
+    }
+
+    private boolean matchesTarget(EntityStore<?> store, Collection<String> targets) {
+        return targets.contains(store.name()) || store.targets().stream().anyMatch(targets::contains);
     }
 }

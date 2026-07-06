@@ -26,6 +26,8 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static com.foogaro.kinexis.core.Misc.*;
 
@@ -203,7 +205,7 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
                 .filter(Objects::nonNull)
                 .toList();
         if (!failures.isEmpty()) {
-            List<String> failedStores = failures.stream().map(StoreFailure::storeName).toList();
+            List<String> failedStores = failedTargets(failures);
             Throwable cause = failures.getFirst().cause();
             throw new ProcessMessageException(
                     "Stores " + failedStores + " failed to " + operationName + " message " + record.getId(),
@@ -224,7 +226,7 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
                 metrics().recordBackpressureRejection();
             }
             Throwable cause = kinexisRejection ? e.getCause() : new KinexisBackpressureException("Kinexis store executor rejected work", e);
-            return CompletableFuture.completedFuture(new StoreFailure(store.name(), cause));
+            return CompletableFuture.completedFuture(new StoreFailure(store.name(), matchingTargets(context, store), cause));
         }
     }
 
@@ -248,7 +250,7 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
                     "store", store.name(),
                     "operation", context.operation(),
                     "exception", e.getClass().getName()));
-            return new StoreFailure(store.name(), e);
+            return new StoreFailure(store.name(), matchingTargets(context, store), e);
         } finally {
             telemetry().recordDuration(KinexisTelemetry.STORE_WRITE_LATENCY,
                     java.time.Duration.ofNanos(System.nanoTime() - startedAt),
@@ -259,12 +261,34 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
         }
     }
 
+    private List<String> matchingTargets(ProcessingContext<T> context, EntityStore<T> store) {
+        if (context.targets().isEmpty()) {
+            return List.of();
+        }
+        return context.targets().stream()
+                .filter(store.targets()::contains)
+                .distinct()
+                .toList();
+    }
+
+    private List<String> failedTargets(List<StoreFailure> failures) {
+        Map<String, Long> targetCounts = failures.stream()
+                .flatMap(failure -> failure.matchingTargets().stream())
+                .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+        return failures.stream()
+                .map(failure -> failure.matchingTargets().stream()
+                        .filter(target -> targetCounts.getOrDefault(target, 0L) == 1L)
+                        .findFirst()
+                        .orElse(failure.storeName()))
+                .toList();
+    }
+
     @FunctionalInterface
     private interface StoreOperation<T> {
         void apply(EntityStore<T> store);
     }
 
-    private record StoreFailure(String storeName, Throwable cause) {
+    private record StoreFailure(String storeName, List<String> matchingTargets, Throwable cause) {
     }
 
     private record ProcessingContext<T>(String eventId,

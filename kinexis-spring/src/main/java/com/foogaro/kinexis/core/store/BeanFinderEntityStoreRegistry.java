@@ -60,8 +60,12 @@ public class BeanFinderEntityStoreRegistry implements EntityStoreRegistry {
         }
         return findTargetStores(entityType)
                 .stream()
-                .filter(store -> store.targets().stream().anyMatch(targets::contains))
+                .filter(store -> matchesTarget(store, targets))
                 .toList();
+    }
+
+    private boolean matchesTarget(EntityStore<?> store, java.util.Collection<String> targets) {
+        return targets.contains(store.name()) || store.targets().stream().anyMatch(targets::contains);
     }
 
     private String storeName(Repository<?, ?> repository) {

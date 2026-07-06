@@ -13,10 +13,12 @@ import org.springframework.data.redis.core.RedisTemplate;
 
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static com.foogaro.kinexis.core.Misc.dumpMessage;
 import static com.foogaro.kinexis.core.Misc.getDLQStreamKey;
+import static com.foogaro.kinexis.core.model.KinexisEvent.EVENT_TARGETS_KEY;
 import static com.foogaro.kinexis.core.handler.AbstractPendingMessageHandler.DLQ_ATTEMPTS_KEY;
 import static com.foogaro.kinexis.core.handler.AbstractPendingMessageHandler.DLQ_CONSUMER_KEY;
 import static com.foogaro.kinexis.core.handler.AbstractPendingMessageHandler.DLQ_ERROR_KEY;
@@ -61,6 +63,29 @@ public class KinexisDlqWriter {
         dumpMessage(message);
         logger.error("Received error: {}", exception.getMessage());
         String deadLetterKey = getDLQStreamKey(entityClass);
+        List<String> failedStores = failedStores(exception);
+        if (failedStores.isEmpty()) {
+            writeDeadLetterRecord(entityClass, deadLetterKey, message, reason, exception, attempts, groupName, consumerName, null);
+        } else {
+            for (String failedStore : failedStores) {
+                writeDeadLetterRecord(entityClass, deadLetterKey, message, reason, exception, attempts, groupName, consumerName, failedStore);
+            }
+        }
+
+        redisTemplate.opsForStream().acknowledge(groupName, message);
+        logger.warn("Message {} moved to dead letter queue for manual processing.", message.getId());
+        logger.warn("And Message {} acknowledged.", message.getId());
+    }
+
+    private void writeDeadLetterRecord(Class<?> entityClass,
+                                       String deadLetterKey,
+                                       MapRecord<String, String, String> message,
+                                       String reason,
+                                       Exception exception,
+                                       long attempts,
+                                       String groupName,
+                                       String consumerName,
+                                       String failedStore) {
         Map<String, String> deadLetterMessage = new HashMap<>(message.getValue());
         deadLetterMessage.put(DLQ_REASON_KEY, reason);
         deadLetterMessage.put(DLQ_ERROR_KEY, exception.getMessage());
@@ -71,8 +96,9 @@ public class KinexisDlqWriter {
         deadLetterMessage.put(DLQ_ATTEMPTS_KEY, String.valueOf(attempts));
         deadLetterMessage.put(DLQ_EXCEPTION_CLASS_KEY, exception.getClass().getName());
         deadLetterMessage.put(DLQ_FAILURE_TIMESTAMP_KEY, Instant.now().toString());
-        if (exception instanceof ProcessMessageException processMessageException && processMessageException.getFailedStore() != null) {
-            deadLetterMessage.put(DLQ_FAILED_STORE_KEY, processMessageException.getFailedStore());
+        if (failedStore != null) {
+            deadLetterMessage.put(DLQ_FAILED_STORE_KEY, failedStore);
+            deadLetterMessage.put(EVENT_TARGETS_KEY, failedStore);
         }
 
         redisTemplate.opsForStream().add(
@@ -81,13 +107,18 @@ public class KinexisDlqWriter {
                         .ofMap(deadLetterMessage)
                         .withStreamKey(deadLetterKey)
         );
-        redisTemplate.opsForStream().acknowledge(groupName, message);
         metrics.recordDeadLetteredRecord();
         telemetry.increment(KinexisTelemetry.DLQ_RECORDS, Map.of(
                 "entity", entityClass.getSimpleName(),
                 "stream", message.getStream(),
-                "reason", reason));
-        logger.warn("Message {} moved to dead letter queue for manual processing.", message.getId());
-        logger.warn("And Message {} acknowledged.", message.getId());
+                "reason", reason,
+                "failedStore", failedStore == null ? "" : failedStore));
+    }
+
+    private List<String> failedStores(Exception exception) {
+        if (exception instanceof ProcessMessageException processMessageException) {
+            return processMessageException.getFailedStores();
+        }
+        return List.of();
     }
 }

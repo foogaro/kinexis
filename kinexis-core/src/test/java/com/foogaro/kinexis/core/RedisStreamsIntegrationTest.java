@@ -10,6 +10,7 @@ import com.foogaro.kinexis.core.handler.AbstractPendingMessageHandler;
 import com.foogaro.kinexis.core.handler.KinexisDlqWriter;
 import com.foogaro.kinexis.core.listener.AbstractStreamListener;
 import com.foogaro.kinexis.core.model.CachingPattern;
+import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisEvent;
 import com.foogaro.kinexis.core.processor.AbstractProcessor;
 import com.foogaro.kinexis.core.processor.KinexisProcessingCoordinator;
@@ -343,6 +344,7 @@ class RedisStreamsIntegrationTest {
         assertEquals(Set.of("redis-om"), redisOmStore.targets());
         assertEquals(List.of(entityStore), registry.findTargetStores(TestEntity.class, TestRepository.class, List.of("primary")));
         assertEquals(List.of(entityStore), registry.findTargetStores(TestEntity.class, List.of("primary")));
+        assertEquals(List.of(entityStore), registry.findTargetStores(TestEntity.class, List.of("mysqlEmployerStore")));
         assertSame(cacheStore, registry.findCacheStore(TestEntity.class).orElseThrow());
     }
 
@@ -910,9 +912,115 @@ class RedisStreamsIntegrationTest {
     }
 
     @Test
+    void pendingHandlerMovesEachFailedTargetStoreToItsOwnDeadLetterRecord() throws Exception {
+        CountingStore postgresql = new CountingStore("employerPostgresStore", "postgresql");
+        InMemoryStore mysql = new InMemoryStore("employerMysqlStore", "mysql");
+        InMemoryStore sqlserver = new InMemoryStore("employerSqlServerStore", "sqlserver");
+        mysql.failSaves = true;
+        sqlserver.failSaves = true;
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(postgresql, mysql, sqlserver),
+                new EmptyEntityStoreRegistry()));
+        MapRecord<String, String, String> record = enqueueAndRead(KinexisEvent.save(
+                TestEntity.class,
+                objectMapper.writeValueAsString(new TestEntity(7L, "PartialFailure")),
+                "postgresql", "mysql", "sqlserver"));
+
+        ProcessMessageException failure = assertThrows(ProcessMessageException.class, () -> processor.process(record));
+        assertEquals(List.of("mysql", "sqlserver"), failure.getFailedStores());
+        assertEquals(Optional.of(new TestEntity(7L, "PartialFailure")), postgresql.findById(7L));
+        assertEquals(1, postgresql.saveCount());
+        assertEquals(1, pendingCount());
+
+        TestPendingMessageHandler handler = pendingHandler(processor, 1);
+        handler.processPendingMessages();
+
+        assertEquals(0, pendingCount());
+        assertEquals(1, postgresql.saveCount());
+        List<MapRecord<String, Object, Object>> dlqRecords = redisTemplate.opsForStream()
+                .range(Misc.getDLQStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(dlqRecords);
+        assertEquals(2, dlqRecords.size());
+        Map<Object, Map<Object, Object>> dlqByFailedStore = dlqRecords.stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        dlq -> dlq.getValue().get(AbstractPendingMessageHandler.DLQ_FAILED_STORE_KEY),
+                        MapRecord::getValue));
+        assertEquals(Set.of("mysql", "sqlserver"), dlqByFailedStore.keySet());
+        assertEquals("mysql", dlqByFailedStore.get("mysql").get(KinexisEvent.EVENT_TARGETS_KEY));
+        assertEquals("sqlserver", dlqByFailedStore.get("sqlserver").get(KinexisEvent.EVENT_TARGETS_KEY));
+        assertEquals("Too many attempts", dlqByFailedStore.get("mysql").get(AbstractPendingMessageHandler.DLQ_REASON_KEY));
+        assertEquals("1", dlqByFailedStore.get("mysql").get(AbstractPendingMessageHandler.DLQ_ATTEMPTS_KEY));
+        assertEquals(ProcessMessageException.class.getName(), dlqByFailedStore.get("sqlserver").get(AbstractPendingMessageHandler.DLQ_EXCEPTION_CLASS_KEY));
+        assertNotNull(dlqByFailedStore.get("sqlserver").get(AbstractPendingMessageHandler.DLQ_FAILURE_TIMESTAMP_KEY));
+    }
+
+    @Test
+    void dlqServiceListsAndReplaysFailedStoresIndependently() throws Exception {
+        CountingStore postgresql = new CountingStore("employerPostgresStore", "postgresql");
+        CountingStore mysql = new CountingStore("employerMysqlStore", "mysql");
+        CountingStore sqlserver = new CountingStore("employerSqlServerStore", "sqlserver");
+        mysql.failSaves = true;
+        sqlserver.failSaves = true;
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(postgresql, mysql, sqlserver),
+                new EmptyEntityStoreRegistry()));
+        MapRecord<String, String, String> originalRecord = enqueueAndRead(KinexisEvent.save(
+                TestEntity.class,
+                15L,
+                objectMapper.writeValueAsString(new TestEntity(15L, "IndependentReplay")),
+                "postgresql", "mysql", "sqlserver"));
+
+        assertThrows(ProcessMessageException.class, () -> processor.process(originalRecord));
+        TestPendingMessageHandler handler = pendingHandler(processor, 1);
+        handler.processPendingMessages();
+
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate);
+        List<KinexisDlqRecord> dlqRecords = dlqService.list(TestEntity.class);
+        assertEquals(2, dlqRecords.size());
+        assertEquals(Set.of("mysql", "sqlserver"), dlqRecords.stream().map(KinexisDlqRecord::failedStore).collect(java.util.stream.Collectors.toSet()));
+        assertEquals(1, dlqService.listByFailedStore(TestEntity.class, "mysql").size());
+        assertEquals(2, dlqService.listByOperation(TestEntity.class, Misc.Operation.SAVE.getValue()).size());
+        assertEquals(2, dlqService.listOlderThan(TestEntity.class, Duration.ZERO).size());
+        assertEquals(1, dlqService.list(TestEntity.class, "sqlserver", Misc.Operation.SAVE.getValue(), Duration.ZERO).size());
+        assertEquals(originalRecord.getValue().get(KinexisEvent.EVENT_ID_KEY), dlqRecords.getFirst().eventId());
+        assertEquals(TestEntity.class.getName(), dlqRecords.getFirst().entityType());
+        assertEquals("15", dlqRecords.getFirst().entityId());
+        assertEquals(1, dlqRecords.getFirst().attempts());
+        assertNotNull(dlqRecords.getFirst().failureTimestamp());
+
+        mysql.failSaves = false;
+        List<String> mysqlReplayIds = dlqService.replayByStore(TestEntity.class, "mysql");
+        assertEquals(1, mysqlReplayIds.size());
+        MapRecord<String, String, String> mysqlReplayRecord = streamRecordById(mysqlReplayIds.getFirst());
+        assertEquals("mysql", mysqlReplayRecord.getValue().get(KinexisEvent.EVENT_TARGETS_KEY));
+        assertEquals(originalRecord.getValue().get(KinexisEvent.EVENT_ID_KEY), mysqlReplayRecord.getValue().get(KinexisEvent.EVENT_ID_KEY));
+        processor.process(mysqlReplayRecord);
+
+        assertEquals(1, postgresql.saveCount());
+        assertEquals(1, mysql.saveCount());
+        assertEquals(0, sqlserver.saveCount());
+        assertEquals(Optional.of(new TestEntity(15L, "IndependentReplay")), mysql.findById(15L));
+        assertTrue(sqlserver.findById(15L).isEmpty());
+
+        sqlserver.failSaves = false;
+        KinexisDlqRecord sqlserverDlq = dlqService.listByFailedStore(TestEntity.class, "sqlserver").getFirst();
+        Optional<String> sqlserverReplayId = dlqService.replayFailedStore(TestEntity.class, sqlserverDlq.recordId());
+        assertTrue(sqlserverReplayId.isPresent());
+        MapRecord<String, String, String> sqlserverReplayRecord = streamRecordById(sqlserverReplayId.get());
+        assertEquals("sqlserver", sqlserverReplayRecord.getValue().get(KinexisEvent.EVENT_TARGETS_KEY));
+        processor.process(sqlserverReplayRecord);
+
+        assertEquals(1, postgresql.saveCount());
+        assertEquals(1, mysql.saveCount());
+        assertEquals(1, sqlserver.saveCount());
+        assertEquals(Optional.of(new TestEntity(15L, "IndependentReplay")), sqlserver.findById(15L));
+    }
+
+    @Test
     void dlqServiceReplaysDeadLetterMessageToOriginalStream() throws Exception {
         backingStore.failSaves = true;
-        enqueueAndRead(KinexisEvent.save(TestEntity.class, objectMapper.writeValueAsString(new TestEntity(8L, "Replay"))));
+        MapRecord<String, String, String> originalRecord = enqueueAndRead(KinexisEvent.save(TestEntity.class, objectMapper.writeValueAsString(new TestEntity(8L, "Replay"))));
+        String originalEventId = originalRecord.getValue().get(KinexisEvent.EVENT_ID_KEY);
         TestPendingMessageHandler handler = pendingHandler(processor, 1);
         handler.processPendingMessages();
         List<MapRecord<String, Object, Object>> dlqRecords = redisTemplate.opsForStream()
@@ -929,6 +1037,15 @@ class RedisStreamsIntegrationTest {
         assertNotNull(streamRecords);
         assertEquals(2, streamRecords.size());
         assertFalse(streamRecords.getLast().getValue().containsKey(AbstractPendingMessageHandler.DLQ_REASON_KEY));
+        assertEquals(originalEventId, streamRecords.getLast().getValue().get(KinexisEvent.EVENT_ID_KEY));
+
+        Optional<String> forcedReplayId = dlqService.replayWithNewEventId(TestEntity.class, dlqRecords.getFirst().getId().getValue());
+        assertTrue(forcedReplayId.isPresent());
+        List<MapRecord<String, Object, Object>> forcedStreamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.closed(forcedReplayId.get(), forcedReplayId.get()));
+        assertNotNull(forcedStreamRecords);
+        assertEquals(1, forcedStreamRecords.size());
+        assertNotEquals(originalEventId, forcedStreamRecords.getFirst().getValue().get(KinexisEvent.EVENT_ID_KEY));
     }
 
     @Test
@@ -1098,6 +1215,14 @@ class RedisStreamsIntegrationTest {
                 .withId(record.getId())
                 .ofMap(values)
                 .withStreamKey(record.getStream());
+    }
+
+    private MapRecord<String, String, String> streamRecordById(String recordId) {
+        List<MapRecord<String, Object, Object>> records = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.closed(recordId, recordId));
+        assertNotNull(records);
+        assertEquals(1, records.size());
+        return convertRecord(records.getFirst());
     }
 
     private long pendingCount() {
@@ -1444,6 +1569,10 @@ class RedisStreamsIntegrationTest {
 
         private CountingStore(String name) {
             super(name);
+        }
+
+        private CountingStore(String name, String... targets) {
+            super(name, targets);
         }
 
         @Override
