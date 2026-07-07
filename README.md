@@ -38,6 +38,7 @@ Existing imports remain stable. Even when using the split modules, public classe
 | Pending retry | Reprocesses pending Redis Stream records using configurable retry limits. |
 | Per-store DLQ and replay | Moves exhausted failures to a dead-letter stream per failed store, lists records through a typed DTO, and replays all records, one store, or one failed-store record. |
 | Backpressure | Bounds in-flight records and executor queue depth, with block, slow-down, or reject-to-DLQ behavior. |
+| Store health controls | Lets operators pause/resume stores and automatically opens per-store circuits after repeated failures. |
 | Telemetry | Exposes dependency-light counters/timers and optionally forwards to Micrometer when a `MeterRegistry` bean exists. |
 | Validation and diagnostics | Validates store wiring at startup and exposes runtime metadata through service APIs. |
 
@@ -55,7 +56,7 @@ Use `kinexis-bom` to align split module versions from one place.
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.2.2</version>
+            <version>2.3.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -84,7 +85,7 @@ Use `kinexis-core` when you want the same one-dependency setup as earlier releas
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.2.2</version>
+    <version>2.3.0</version>
 </dependency>
 ```
 
@@ -98,7 +99,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.2.2</version>
+    <version>2.3.0</version>
 </dependency>
 ```
 
@@ -112,12 +113,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.2.2</version>
+    <version>2.3.0</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.2.2</version>
+    <version>2.3.0</version>
 </dependency>
 ```
 
@@ -129,7 +130,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.2.2</version>
+    <version>2.3.0</version>
 </dependency>
 ```
 
@@ -142,7 +143,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.2.2</version>
+        <version>2.3.0</version>
     </path>
 </annotationProcessorPaths>
 ```
@@ -199,6 +200,12 @@ kinexis.processing.backpressure.max-in-flight-per-stream=0
 kinexis.processing.backpressure.executor-queue-size=1024
 kinexis.processing.backpressure.queue-full-behavior=BLOCK
 kinexis.processing.backpressure.slow-down-delay=100ms
+
+kinexis.store-health.enabled=true
+kinexis.store-health.failure-threshold=10
+kinexis.store-health.open-duration=60s
+kinexis.store-health.probe-success-threshold=3
+kinexis.store-health.failure-window=5m
 
 kinexis.validation.enabled=true
 kinexis.validation.fail-fast=true
@@ -562,6 +569,50 @@ Queue-full behavior:
 
 `KinexisProcessingMetrics` exposes queue depth, active worker count, rejections, slowdowns, pending retries, and DLQ counts without requiring a metrics dependency.
 
+## Store Health And Circuit Breaking
+
+Kinexis can protect target stores from repeated write-behind calls when one backend is unhealthy.
+
+Inject `KinexisStoreControl` to inspect or change store state at runtime:
+
+```java
+import com.foogaro.kinexis.core.model.KinexisStoreHealthStatus;
+import com.foogaro.kinexis.core.service.KinexisStoreControl;
+
+import java.util.List;
+
+kinexisStoreControl.pause(Employer.class, "mysql");
+kinexisStoreControl.resume(Employer.class, "mysql");
+kinexisStoreControl.degrade(Employer.class, "postgresql");
+kinexisStoreControl.openCircuit(Employer.class, "sqlserver");
+
+KinexisStoreHealthStatus mysql = kinexisStoreControl.status(Employer.class, "mysql");
+List<KinexisStoreHealthStatus> employerStores = kinexisStoreControl.status(Employer.class);
+List<KinexisStoreHealthStatus> allStores = kinexisStoreControl.statuses();
+```
+
+Runtime states:
+
+| State | Behavior |
+| --- | --- |
+| `ACTIVE` | Store calls run normally. |
+| `PAUSED` | Store calls are skipped and reported as store failures, so normal pending retry and per-store DLQ behavior applies. |
+| `DEGRADED` | Store calls still run, but the store has recent failures inside the configured failure window. |
+| `OPEN_CIRCUIT` | Store calls are skipped until `open-duration` has elapsed. |
+| `RECOVERING` | Store calls are allowed as probes; after enough successful probes, the store returns to `ACTIVE`. |
+
+Automatic circuit opening is local to the running application instance and dependency-free. When a store fails `failure-threshold` times inside `failure-window`, Kinexis opens that store's circuit. After `open-duration`, the next call enters `RECOVERING`. When `probe-success-threshold` calls succeed, the circuit closes and the store returns to `ACTIVE`.
+
+Skipped store calls are not marked idempotently processed. They remain eligible for normal pending retry and per-store DLQ. DLQ replay methods that target a failed store skip `PAUSED` and `OPEN_CIRCUIT` stores by default; use `KinexisReplayOptions.forced()` only for an intentional operator override.
+
+```properties
+kinexis.store-health.enabled=true
+kinexis.store-health.failure-threshold=10
+kinexis.store-health.open-duration=60s
+kinexis.store-health.probe-success-threshold=3
+kinexis.store-health.failure-window=5m
+```
+
 ## Telemetry
 
 `KinexisTelemetry` is dependency-light and lives in `kinexis-api`. The default runtime uses `SimpleKinexisTelemetry`. If Micrometer is already present and a `MeterRegistry` bean exists, `kinexis-spring` also forwards metrics to Micrometer through reflection.
@@ -589,6 +640,13 @@ Core metrics:
 | `kinexis.processing.deadletter.records` | Counter | none |
 | `kinexis.processing.store.executor.queue.depth` | Gauge | none |
 | `kinexis.processing.store.executor.active.workers` | Gauge | none |
+| `kinexis.store.health.state` | Gauge | `entity`, `store`, `state` |
+| `kinexis.store.circuit.opened` | Counter | `entity`, `store` |
+| `kinexis.store.circuit.closed` | Counter | `entity`, `store` |
+| `kinexis.store.paused` | Counter | `entity`, `store` |
+| `kinexis.store.resumed` | Counter | `entity`, `store` |
+| `kinexis.store.probe.failures` | Counter | `entity`, `store` |
+| `kinexis.store.probe.successes` | Counter | `entity`, `store` |
 
 `eventIdMode` is `preserved` for normal replay and `new` for `replayWithNewEventId(...)`.
 `KinexisProcessingMetrics` still exposes a local snapshot for diagnostics, and the Spring runtime now bridges its counters and executor gauges into `KinexisTelemetry`.
@@ -645,7 +703,7 @@ public class KinexisAdminService {
 }
 ```
 
-Diagnostics include entity class, enabled flag, patterns, TTL, cache store, primary store, target stores, and all known stores for duplicate or ambiguity checks.
+Diagnostics include entity class, enabled flag, patterns, TTL, cache store, primary store, target stores, all known stores for duplicate or ambiguity checks, and each store's current health status when `KinexisStoreControl` is available.
 
 ## Dead-Letter Queue And Replay
 
@@ -725,6 +783,24 @@ Optional<String> replayedId = kinexisDlqService.replayFailedStore(
 );
 ```
 
+For operator workflows, prefer the typed result API. It reports whether the record was replayed, missing, failed, or skipped because the failed store is currently paused or has an open circuit:
+
+```java
+import com.foogaro.kinexis.core.model.KinexisReplayOptions;
+import com.foogaro.kinexis.core.model.KinexisReplayResult;
+
+KinexisReplayResult result =
+        kinexisDlqService.replayFailedStoreResult(Employer.class, dlqRecordId);
+
+KinexisReplayResult forced =
+        kinexisDlqService.replayFailedStoreResult(
+                Employer.class,
+                dlqRecordId,
+                KinexisDlqService.ReplayMode.REPLAY_ONLY,
+                KinexisReplayOptions.forced()
+        );
+```
+
 Replay every DLQ record for a failed store:
 
 ```java
@@ -732,6 +808,16 @@ List<String> replayedIds = kinexisDlqService.replayByStore(
         Employer.class,
         "mysql"
 );
+```
+
+The result-returning variants include skipped records instead of silently dropping them:
+
+```java
+List<KinexisReplayResult> mysqlResults =
+        kinexisDlqService.replayByStoreIfHealthy(Employer.class, "mysql");
+
+List<KinexisReplayResult> allHealthyResults =
+        kinexisDlqService.replayAllHealthyFailedStores(Employer.class);
 ```
 
 Replay all failed-store records for an entity type:
@@ -802,6 +888,11 @@ This fallback uses generic Spring Data `CrudRepository` adapters. Register `Redi
 | `kinexis.processing.backpressure.executor-queue-size` | `1024` | Bounded queue size for asynchronous target-store work. |
 | `kinexis.processing.backpressure.queue-full-behavior` | `BLOCK` | Overload behavior: `BLOCK`, `SLOW_DOWN`, or `REJECT_TO_DLQ`. |
 | `kinexis.processing.backpressure.slow-down-delay` | `100ms` | Delay between capacity checks when behavior is `SLOW_DOWN`. |
+| `kinexis.store-health.enabled` | `true` | Enables per-store health state, pause/resume, and automatic circuit breaking. |
+| `kinexis.store-health.failure-threshold` | `10` | Failures inside the failure window before opening a store circuit. |
+| `kinexis.store-health.open-duration` | `60s` | Time an opened circuit stays closed to store calls before recovery probes. |
+| `kinexis.store-health.probe-success-threshold` | `3` | Successful recovery probes required before returning to `ACTIVE`. |
+| `kinexis.store-health.failure-window` | `5m` | Rolling failure window used for circuit opening. |
 | `kinexis.validation.enabled` | `true` | Enables startup validation. |
 | `kinexis.validation.fail-fast` | `true` | Fails startup when validation errors exist. |
 | `kinexis.stores.repository-discovery.enabled` | `false` | Enables deprecated repository-name discovery. |
@@ -826,7 +917,7 @@ Run a demo module:
 ./mvnw -pl demo/kinexis-demo-psql -am test
 ```
 
-The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, partitioning, idempotency, telemetry, and generated-code compatibility.
+The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, store health controls, circuit breaking, partitioning, idempotency, telemetry, and generated-code compatibility.
 
 ## Demo Projects
 

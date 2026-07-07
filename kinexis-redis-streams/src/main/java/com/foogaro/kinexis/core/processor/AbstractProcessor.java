@@ -6,8 +6,11 @@ import com.foogaro.kinexis.core.Misc;
 import com.foogaro.kinexis.core.config.KinexisProperties;
 import com.foogaro.kinexis.core.exception.AcknowledgeMessageException;
 import com.foogaro.kinexis.core.exception.KinexisBackpressureException;
+import com.foogaro.kinexis.core.exception.KinexisStoreUnavailableException;
 import com.foogaro.kinexis.core.exception.ProcessMessageException;
 import com.foogaro.kinexis.core.model.KinexisEvent;
+import com.foogaro.kinexis.core.model.KinexisStoreHealthState;
+import com.foogaro.kinexis.core.service.KinexisStoreControl;
 import com.foogaro.kinexis.core.store.EntityStore;
 import com.foogaro.kinexis.core.store.EntityStoreRegistry;
 import com.foogaro.kinexis.core.telemetry.KinexisTelemetry;
@@ -62,6 +65,9 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
 
     @Autowired(required = false)
     private KinexisProcessingMetrics processingMetrics;
+
+    @Autowired(required = false)
+    private KinexisStoreControl storeControl;
 
     @Autowired(required = false)
     private KinexisTelemetry telemetry;
@@ -240,17 +246,31 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
                 logger.debug("Skipping already processed event {} for store {} and message {}", context.eventId(), store.name(), record.getId());
                 return null;
             }
+            storeControl().beforeCall(getEntityClass(), store.name());
             operation.apply(store);
+            storeControl().recordSuccess(getEntityClass(), store.name());
             coordinator().markProcessed(getEntityClass(), context.eventId(), store.name());
             return null;
-        } catch (Exception e) {
-            metrics().recordStoreTaskFailed();
+        } catch (KinexisStoreUnavailableException e) {
             telemetry().increment(KinexisTelemetry.STORE_FAILURES, Map.of(
                     "entity", getEntityClass().getSimpleName(),
                     "store", store.name(),
                     "operation", context.operation(),
                     "exception", e.getClass().getName()));
             return new StoreFailure(store.name(), matchingTargets(context, store), e);
+        } catch (Exception e) {
+            KinexisStoreHealthState stateBeforeFailure = storeControl().status(getEntityClass(), store.name()).state();
+            storeControl().recordFailure(getEntityClass(), store.name(), e);
+            metrics().recordStoreTaskFailed();
+            telemetry().increment(KinexisTelemetry.STORE_FAILURES, Map.of(
+                    "entity", getEntityClass().getSimpleName(),
+                    "store", store.name(),
+                    "operation", context.operation(),
+                    "exception", e.getClass().getName()));
+            Throwable failure = stateBeforeFailure == KinexisStoreHealthState.RECOVERING
+                    ? new KinexisStoreUnavailableException(store.name(), "Store " + store.name() + " recovering probe failed", e)
+                    : e;
+            return new StoreFailure(store.name(), matchingTargets(context, store), failure);
         } finally {
             telemetry().recordDuration(KinexisTelemetry.STORE_WRITE_LATENCY,
                     java.time.Duration.ofNanos(System.nanoTime() - startedAt),
@@ -311,6 +331,13 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
             processingMetrics = new KinexisProcessingMetrics();
         }
         return processingMetrics;
+    }
+
+    private KinexisStoreControl storeControl() {
+        if (storeControl == null) {
+            storeControl = new KinexisStoreControl(new KinexisProperties(), telemetry());
+        }
+        return storeControl;
     }
 
     private KinexisTelemetry telemetry() {

@@ -27,7 +27,7 @@ Prefer the BOM when using split modules:
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.2.2</version>
+            <version>2.3.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -60,7 +60,7 @@ If you prefer the compatibility bundle:
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.2.2</version>
+    <version>2.3.0</version>
 </dependency>
 ```
 
@@ -119,6 +119,12 @@ kinexis.processing.idempotency.retention=7d
 kinexis.processing.ordering.per-entity-enabled=true
 kinexis.processing.backpressure.executor-queue-size=1024
 kinexis.processing.backpressure.queue-full-behavior=BLOCK
+
+kinexis.store-health.enabled=true
+kinexis.store-health.failure-threshold=10
+kinexis.store-health.open-duration=60s
+kinexis.store-health.probe-success-threshold=3
+kinexis.store-health.failure-window=5m
 
 kinexis.validation.enabled=true
 kinexis.validation.fail-fast=true
@@ -376,12 +382,27 @@ For `save(entity)` or `delete(id)` with write-behind:
 
 If MySQL succeeds, PostgreSQL fails, and the retry limit is reached, only PostgreSQL gets a DLQ record. A normal replay preserves the original `eventId`, so MySQL is not written again.
 
+## Store Health
+
+Inject `KinexisStoreControl` when operators need to pause, resume, inspect, or manually open a circuit for one store:
+
+```java
+kinexisStoreControl.pause(Employer.class, "mysql");
+kinexisStoreControl.resume(Employer.class, "mysql");
+kinexisStoreControl.openCircuit(Employer.class, "postgresql");
+kinexisStoreControl.status(Employer.class, "mysql");
+```
+
+Kinexis also opens a store circuit automatically after repeated failures. While a store is paused or its circuit is open, calls to that store are skipped and the normal pending retry and per-store DLQ flow applies. Store-targeted DLQ replay skips paused and open-circuit stores by default; use `KinexisReplayOptions.forced()` only when an operator explicitly wants to override the guardrail.
+
 ## DLQ Operations
 
 Inject `KinexisDlqService` for operational replay:
 
 ```java
 import com.foogaro.kinexis.core.model.KinexisDlqRecord;
+import com.foogaro.kinexis.core.model.KinexisReplayOptions;
+import com.foogaro.kinexis.core.model.KinexisReplayResult;
 import com.foogaro.kinexis.core.service.KinexisDlqService;
 
 import java.util.List;
@@ -394,6 +415,20 @@ List<KinexisDlqRecord> mysqlFailures =
 kinexisDlqService.replayFailedStore(Employer.class, dlqRecordId);
 kinexisDlqService.replayByStore(Employer.class, "postgresql");
 kinexisDlqService.replayAllFailedStores(Employer.class);
+
+KinexisReplayResult result =
+        kinexisDlqService.replayFailedStoreResult(Employer.class, dlqRecordId);
+
+List<KinexisReplayResult> postgresResults =
+        kinexisDlqService.replayByStoreIfHealthy(Employer.class, "postgresql");
+
+KinexisReplayResult forced =
+        kinexisDlqService.replayFailedStoreResult(
+                Employer.class,
+                dlqRecordId,
+                KinexisDlqService.ReplayMode.REPLAY_ONLY,
+                KinexisReplayOptions.forced()
+        );
 ```
 
 Use `replayWithNewEventId(...)` only when you explicitly want the replay to be treated as new work by all matching stores.

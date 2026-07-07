@@ -24,6 +24,13 @@ public interface KinexisTelemetry {
     String PROCESSING_DEAD_LETTERED_RECORDS = "kinexis.processing.deadletter.records";
     String PROCESSING_STORE_EXECUTOR_QUEUE_DEPTH = "kinexis.processing.store.executor.queue.depth";
     String PROCESSING_STORE_EXECUTOR_ACTIVE_WORKERS = "kinexis.processing.store.executor.active.workers";
+    String STORE_HEALTH_STATE = "kinexis.store.health.state";
+    String STORE_CIRCUIT_OPENED = "kinexis.store.circuit.opened";
+    String STORE_CIRCUIT_CLOSED = "kinexis.store.circuit.closed";
+    String STORE_PAUSED = "kinexis.store.paused";
+    String STORE_RESUMED = "kinexis.store.resumed";
+    String STORE_PROBE_FAILURES = "kinexis.store.probe.failures";
+    String STORE_PROBE_SUCCESSES = "kinexis.store.probe.successes";
 
     void increment(String name, Map<String, String> tags);
 

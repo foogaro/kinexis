@@ -9,6 +9,7 @@ import com.foogaro.kinexis.core.service.KinexisDlqService;
 import com.foogaro.kinexis.core.service.KinexisDiagnosticsService;
 import com.foogaro.kinexis.core.service.KinexisEntityRegistry;
 import com.foogaro.kinexis.core.service.KinexisService;
+import com.foogaro.kinexis.core.service.KinexisStoreControl;
 import com.foogaro.kinexis.core.service.KinexisStoreValidator;
 import com.foogaro.kinexis.core.processor.KinexisProcessingCoordinator;
 import com.foogaro.kinexis.core.processor.KinexisProcessingMetrics;
@@ -236,6 +237,12 @@ public class KinexisConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
+    public KinexisStoreControl kinexisStoreControl(KinexisProperties properties, KinexisTelemetry telemetry) {
+        return new KinexisStoreControl(properties, telemetry);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
     public KinexisTelemetry kinexisTelemetry(ListableBeanFactory beanFactory) {
         ArrayList<KinexisTelemetry> telemetry = new ArrayList<>();
         telemetry.add(new SimpleKinexisTelemetry());
@@ -246,8 +253,9 @@ public class KinexisConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public KinexisDlqService kinexisDlqService(@Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate,
-                                               KinexisTelemetry telemetry) {
-        return new KinexisDlqService(redisTemplate, telemetry);
+                                               KinexisTelemetry telemetry,
+                                               KinexisStoreControl storeControl) {
+        return new KinexisDlqService(redisTemplate, telemetry, storeControl);
     }
 
     @Bean
@@ -279,14 +287,16 @@ public class KinexisConfiguration {
                                                                ObjectProvider<KinexisService<?>> services,
                                                                ObjectProvider<KinexisEntityRegistry> entityRegistries,
                                                                EntityStoreRegistry entityStoreRegistry,
-                                                               AnnotationFinder annotationFinder) {
+                                                               AnnotationFinder annotationFinder,
+                                                               KinexisStoreControl storeControl) {
         return new KinexisDiagnosticsService(
                 entityStores.orderedStream().toList(),
                 processors.orderedStream().toList(),
                 services.orderedStream().toList(),
                 entityRegistries.orderedStream().toList(),
                 entityStoreRegistry,
-                annotationFinder);
+                annotationFinder,
+                storeControl);
     }
 
     @Bean

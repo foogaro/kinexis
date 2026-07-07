@@ -1,6 +1,7 @@
 package com.foogaro.kinexis.core.service;
 
 import com.foogaro.kinexis.core.model.CachingPattern;
+import com.foogaro.kinexis.core.model.KinexisStoreHealthStatus;
 import com.foogaro.kinexis.core.processor.Processor;
 import com.foogaro.kinexis.core.store.CacheStore;
 import com.foogaro.kinexis.core.store.EntityStore;
@@ -21,6 +22,7 @@ public class KinexisDiagnosticsService {
     private final List<KinexisEntityRegistry> entityRegistries;
     private final EntityStoreRegistry entityStoreRegistry;
     private final AnnotationFinder annotationFinder;
+    private final KinexisStoreControl storeControl;
 
     public KinexisDiagnosticsService(Collection<EntityStore<?>> explicitStores,
                                      Collection<Processor<?>> processors,
@@ -28,12 +30,23 @@ public class KinexisDiagnosticsService {
                                      Collection<KinexisEntityRegistry> entityRegistries,
                                      EntityStoreRegistry entityStoreRegistry,
                                      AnnotationFinder annotationFinder) {
+        this(explicitStores, processors, services, entityRegistries, entityStoreRegistry, annotationFinder, null);
+    }
+
+    public KinexisDiagnosticsService(Collection<EntityStore<?>> explicitStores,
+                                     Collection<Processor<?>> processors,
+                                     Collection<KinexisService<?>> services,
+                                     Collection<KinexisEntityRegistry> entityRegistries,
+                                     EntityStoreRegistry entityStoreRegistry,
+                                     AnnotationFinder annotationFinder,
+                                     KinexisStoreControl storeControl) {
         this.explicitStores = List.copyOf(explicitStores);
         this.processors = List.copyOf(processors);
         this.services = List.copyOf(services);
         this.entityRegistries = List.copyOf(entityRegistries);
         this.entityStoreRegistry = entityStoreRegistry;
         this.annotationFinder = annotationFinder;
+        this.storeControl = storeControl;
     }
 
     public List<EntityDiagnostics> stores() {
@@ -92,7 +105,8 @@ public class KinexisDiagnosticsService {
                 store.entityType(),
                 store.entityType().getName(),
                 store.targets(),
-                store instanceof CacheStore<?>);
+                store instanceof CacheStore<?>,
+                storeControl == null ? null : storeControl.status(store.entityType(), store.name()));
     }
 
     public record EntityDiagnostics(Class<?> entityType,
@@ -111,6 +125,15 @@ public class KinexisDiagnosticsService {
                                    Class<?> entityType,
                                    String entityName,
                                    Set<String> targets,
-                                   boolean cache) {
+                                   boolean cache,
+                                   KinexisStoreHealthStatus health) {
+
+        public StoreDiagnostics(String name,
+                                Class<?> entityType,
+                                String entityName,
+                                Set<String> targets,
+                                boolean cache) {
+            this(name, entityType, entityName, targets, cache, null);
+        }
     }
 }

@@ -97,6 +97,36 @@
       "defaultValue": "100ms"
     },
     {
+      "name": "kinexis.store-health.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Enables per-store health state, manual pause/resume, and automatic circuit breaking for target stores.",
+      "defaultValue": true
+    },
+    {
+      "name": "kinexis.store-health.failure-threshold",
+      "type": "java.lang.Integer",
+      "description": "Number of store failures within the failure window before the store circuit is opened.",
+      "defaultValue": 10
+    },
+    {
+      "name": "kinexis.store-health.open-duration",
+      "type": "java.time.Duration",
+      "description": "How long an opened store circuit remains closed to store calls before entering recovery probe mode.",
+      "defaultValue": "60s"
+    },
+    {
+      "name": "kinexis.store-health.probe-success-threshold",
+      "type": "java.lang.Integer",
+      "description": "Number of successful recovery probe writes needed before a store returns to ACTIVE.",
+      "defaultValue": 3
+    },
+    {
+      "name": "kinexis.store-health.failure-window",
+      "type": "java.time.Duration",
+      "description": "Rolling window used to count store failures for circuit opening.",
+      "defaultValue": "5m"
+    },
+    {
       "name": "kinexis.validation.enabled",
       "type": "java.lang.Boolean",
       "description": "Enables startup validation of Kinexis entity/store configuration.",

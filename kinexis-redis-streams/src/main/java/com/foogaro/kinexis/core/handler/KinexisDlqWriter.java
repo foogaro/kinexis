@@ -1,6 +1,7 @@
 package com.foogaro.kinexis.core.handler;
 
 import com.foogaro.kinexis.core.exception.ProcessMessageException;
+import com.foogaro.kinexis.core.exception.KinexisStoreUnavailableException;
 import com.foogaro.kinexis.core.processor.KinexisProcessingMetrics;
 import com.foogaro.kinexis.core.telemetry.KinexisTelemetry;
 import com.foogaro.kinexis.core.telemetry.SimpleKinexisTelemetry;
@@ -87,7 +88,8 @@ public class KinexisDlqWriter {
                                        String consumerName,
                                        String failedStore) {
         Map<String, String> deadLetterMessage = new HashMap<>(message.getValue());
-        deadLetterMessage.put(DLQ_REASON_KEY, reason);
+        String dlqReason = dlqReason(reason, exception);
+        deadLetterMessage.put(DLQ_REASON_KEY, dlqReason);
         deadLetterMessage.put(DLQ_ERROR_KEY, exception.getMessage());
         deadLetterMessage.put(DLQ_STREAM_KEY, message.getStream());
         deadLetterMessage.put(DLQ_STREAM_ID_KEY, message.getId().getValue());
@@ -111,8 +113,30 @@ public class KinexisDlqWriter {
         telemetry.increment(KinexisTelemetry.DLQ_RECORDS, Map.of(
                 "entity", entityClass.getSimpleName(),
                 "stream", message.getStream(),
-                "reason", reason,
+                "reason", dlqReason,
                 "failedStore", failedStore == null ? "" : failedStore));
+    }
+
+    private String dlqReason(String fallback, Exception exception) {
+        Throwable cause = exception instanceof ProcessMessageException processMessageException
+                ? processMessageException.getCause()
+                : exception;
+        if (cause instanceof KinexisStoreUnavailableException storeUnavailableException) {
+            String message = storeUnavailableException.getMessage();
+            if (message != null) {
+                String lowerMessage = message.toLowerCase();
+                if (lowerMessage.contains("paused")) {
+                    return "Store paused";
+                }
+                if (lowerMessage.contains("recovering probe failed")) {
+                    return "Store recovering probe failed";
+                }
+                if (lowerMessage.contains("circuit is open")) {
+                    return "Store circuit open";
+                }
+            }
+        }
+        return fallback;
     }
 
     private List<String> failedStores(Exception exception) {

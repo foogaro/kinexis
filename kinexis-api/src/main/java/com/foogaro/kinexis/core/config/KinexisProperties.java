@@ -7,6 +7,7 @@ public class KinexisProperties {
     private final Stream stream = new Stream();
     private final Stores stores = new Stores();
     private final Processing processing = new Processing();
+    private final StoreHealth storeHealth = new StoreHealth();
     private final Validation validation = new Validation();
 
     public Stream getStream() {
@@ -19,6 +20,10 @@ public class KinexisProperties {
 
     public Processing getProcessing() {
         return processing;
+    }
+
+    public StoreHealth getStoreHealth() {
+        return storeHealth;
     }
 
     public Validation getValidation() {
@@ -154,6 +159,55 @@ public class KinexisProperties {
         BLOCK,
         REJECT_TO_DLQ,
         SLOW_DOWN
+    }
+
+    public static class StoreHealth {
+
+        private boolean enabled = true;
+        private int failureThreshold = 10;
+        private Duration openDuration = Duration.ofSeconds(60);
+        private int probeSuccessThreshold = 3;
+        private Duration failureWindow = Duration.ofMinutes(5);
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public int getFailureThreshold() {
+            return failureThreshold;
+        }
+
+        public void setFailureThreshold(int failureThreshold) {
+            this.failureThreshold = failureThreshold;
+        }
+
+        public Duration getOpenDuration() {
+            return openDuration;
+        }
+
+        public void setOpenDuration(Duration openDuration) {
+            this.openDuration = openDuration;
+        }
+
+        public int getProbeSuccessThreshold() {
+            return probeSuccessThreshold;
+        }
+
+        public void setProbeSuccessThreshold(int probeSuccessThreshold) {
+            this.probeSuccessThreshold = probeSuccessThreshold;
+        }
+
+        public Duration getFailureWindow() {
+            return failureWindow;
+        }
+
+        public void setFailureWindow(Duration failureWindow) {
+            this.failureWindow = failureWindow;
+        }
     }
 
     public static class Validation {

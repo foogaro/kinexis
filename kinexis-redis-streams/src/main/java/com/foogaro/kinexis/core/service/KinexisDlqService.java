@@ -2,8 +2,13 @@ package com.foogaro.kinexis.core.service;
 
 import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisEvent;
+import com.foogaro.kinexis.core.model.KinexisReplayOptions;
+import com.foogaro.kinexis.core.model.KinexisReplayResult;
+import com.foogaro.kinexis.core.model.KinexisReplayStatus;
+import com.foogaro.kinexis.core.model.KinexisStoreHealthStatus;
 import com.foogaro.kinexis.core.telemetry.KinexisTelemetry;
 import com.foogaro.kinexis.core.telemetry.SimpleKinexisTelemetry;
+import com.foogaro.kinexis.core.config.KinexisProperties;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.connection.stream.RecordId;
@@ -47,14 +52,22 @@ public class KinexisDlqService {
 
     private final RedisTemplate<String, String> redisTemplate;
     private final KinexisTelemetry telemetry;
+    private final KinexisStoreControl storeControl;
 
     public KinexisDlqService(RedisTemplate<String, String> redisTemplate) {
         this(redisTemplate, new SimpleKinexisTelemetry());
     }
 
     public KinexisDlqService(RedisTemplate<String, String> redisTemplate, KinexisTelemetry telemetry) {
+        this(redisTemplate, telemetry, new KinexisStoreControl(new KinexisProperties(), telemetry));
+    }
+
+    public KinexisDlqService(RedisTemplate<String, String> redisTemplate,
+                             KinexisTelemetry telemetry,
+                             KinexisStoreControl storeControl) {
         this.redisTemplate = redisTemplate;
         this.telemetry = telemetry;
+        this.storeControl = storeControl;
     }
 
     public Optional<String> replay(Class<?> entityType, String dlqRecordId) {
@@ -86,6 +99,13 @@ public class KinexisDlqService {
     }
 
     public Optional<String> replayFailedStore(Class<?> entityType, String dlqRecordId, ReplayMode replayMode) {
+        return replayFailedStore(entityType, dlqRecordId, replayMode, KinexisReplayOptions.safe());
+    }
+
+    public Optional<String> replayFailedStore(Class<?> entityType,
+                                              String dlqRecordId,
+                                              ReplayMode replayMode,
+                                              KinexisReplayOptions options) {
         Optional<MapRecord<String, Object, Object>> record = findRecord(entityType, dlqRecordId);
         if (record.isEmpty()) {
             recordReplayFailure(entityType, null, replayMode, false, "notFound");
@@ -93,7 +113,48 @@ public class KinexisDlqService {
         }
         String failedStore = value(record.get(), DLQ_FAILED_STORE_KEY);
         String[] targets = failedStore == null || failedStore.isBlank() ? new String[0] : new String[]{failedStore};
+        Optional<String> unhealthyReason = unhealthyReplayReason(entityType, failedStore, options);
+        if (unhealthyReason.isPresent()) {
+            recordReplayFailure(entityType, record.get(), replayMode, false, unhealthyReason.get(), targets);
+            return Optional.empty();
+        }
         return replayRecordSafely(getDLQStreamKey(entityType), entityType, record.get(), replayMode, false, targets);
+    }
+
+    public KinexisReplayResult replayFailedStoreResult(Class<?> entityType, String dlqRecordId) {
+        return replayFailedStoreResult(entityType, dlqRecordId, ReplayMode.REPLAY_ONLY, KinexisReplayOptions.safe());
+    }
+
+    public KinexisReplayResult replayFailedStoreResult(Class<?> entityType,
+                                                       String dlqRecordId,
+                                                       ReplayMode replayMode) {
+        return replayFailedStoreResult(entityType, dlqRecordId, replayMode, KinexisReplayOptions.safe());
+    }
+
+    public KinexisReplayResult replayFailedStoreResult(Class<?> entityType,
+                                                       String dlqRecordId,
+                                                       ReplayMode replayMode,
+                                                       KinexisReplayOptions options) {
+        Optional<MapRecord<String, Object, Object>> record = findRecord(entityType, dlqRecordId);
+        if (record.isEmpty()) {
+            recordReplayFailure(entityType, null, replayMode, false, "notFound");
+            return KinexisReplayResult.notFound(dlqRecordId);
+        }
+        String failedStore = value(record.get(), DLQ_FAILED_STORE_KEY);
+        String[] targets = failedStore == null || failedStore.isBlank() ? new String[0] : new String[]{failedStore};
+        Optional<String> unhealthyReason = unhealthyReplayReason(entityType, failedStore, options);
+        if (unhealthyReason.isPresent()) {
+            recordReplayFailure(entityType, record.get(), replayMode, false, unhealthyReason.get(), targets);
+            return KinexisReplayResult.skipped(dlqRecordId, failedStore, unhealthyReason.get());
+        }
+        try {
+            Optional<String> replayedId = replayRecordSafely(getDLQStreamKey(entityType), entityType, record.get(), replayMode, false, targets);
+            return replayedId
+                    .map(id -> KinexisReplayResult.replayed(dlqRecordId, id, failedStore))
+                    .orElseGet(() -> KinexisReplayResult.failed(dlqRecordId, failedStore, "appendReturnedNull"));
+        } catch (RuntimeException e) {
+            return KinexisReplayResult.failed(dlqRecordId, failedStore, e.getClass().getName());
+        }
     }
 
     public List<String> replayAllFailedStores(Class<?> entityType) {
@@ -101,10 +162,20 @@ public class KinexisDlqService {
     }
 
     public List<String> replayAllFailedStores(Class<?> entityType, ReplayMode replayMode) {
+        return replayAllHealthyFailedStores(entityType, replayMode).stream()
+                .filter(result -> result.status() == KinexisReplayStatus.REPLAYED)
+                .map(KinexisReplayResult::replayedRecordId)
+                .toList();
+    }
+
+    public List<KinexisReplayResult> replayAllHealthyFailedStores(Class<?> entityType) {
+        return replayAllHealthyFailedStores(entityType, ReplayMode.REPLAY_ONLY);
+    }
+
+    public List<KinexisReplayResult> replayAllHealthyFailedStores(Class<?> entityType, ReplayMode replayMode) {
         return list(entityType).stream()
                 .filter(record -> record.failedStore() != null && !record.failedStore().isBlank())
-                .map(record -> replayFailedStore(entityType, record.recordId(), replayMode))
-                .flatMap(Optional::stream)
+                .map(record -> replayFailedStoreResult(entityType, record.recordId(), replayMode))
                 .toList();
     }
 
@@ -113,9 +184,28 @@ public class KinexisDlqService {
     }
 
     public List<String> replayByStore(Class<?> entityType, String failedStore, ReplayMode replayMode) {
+        return replayByStoreIfHealthy(entityType, failedStore, replayMode).stream()
+                .filter(result -> result.status() == KinexisReplayStatus.REPLAYED)
+                .map(KinexisReplayResult::replayedRecordId)
+                .toList();
+    }
+
+    public List<KinexisReplayResult> replayByStoreIfHealthy(Class<?> entityType, String failedStore) {
+        return replayByStoreIfHealthy(entityType, failedStore, ReplayMode.REPLAY_ONLY);
+    }
+
+    public List<KinexisReplayResult> replayByStoreIfHealthy(Class<?> entityType, String failedStore, ReplayMode replayMode) {
         return listByFailedStore(entityType, failedStore).stream()
-                .map(record -> replayFailedStore(entityType, record.recordId(), replayMode))
-                .flatMap(Optional::stream)
+                .map(record -> replayFailedStoreResult(entityType, record.recordId(), replayMode))
+                .toList();
+    }
+
+    public List<KinexisReplayResult> replayByStore(Class<?> entityType,
+                                                   String failedStore,
+                                                   ReplayMode replayMode,
+                                                   KinexisReplayOptions options) {
+        return listByFailedStore(entityType, failedStore).stream()
+                .map(record -> replayFailedStoreResult(entityType, record.recordId(), replayMode, options))
                 .toList();
     }
 
@@ -163,6 +253,20 @@ public class KinexisDlqService {
             return Optional.empty();
         }
         return replayRecordSafely(dlqStreamKey, entityType, record.get(), replayMode, newEventId, targets);
+    }
+
+    private Optional<String> unhealthyReplayReason(Class<?> entityType, String failedStore, KinexisReplayOptions options) {
+        if (options != null && options.force()) {
+            return Optional.empty();
+        }
+        if (failedStore == null || failedStore.isBlank()) {
+            return Optional.empty();
+        }
+        KinexisStoreHealthStatus status = storeControl.status(entityType, failedStore);
+        if (status.available()) {
+            return Optional.empty();
+        }
+        return Optional.of("unhealthyStore:" + status.state().name());
     }
 
     private Optional<String> replayRecordSafely(String dlqStreamKey,

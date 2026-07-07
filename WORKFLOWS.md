@@ -66,11 +66,23 @@ graph TD
     IdemD -- "yes" --> SkipD["Skip"]
     IdemE -- "yes" --> SkipE["Skip"]
 
-    IdemA -- "no" --> WriteA["save/delete"]
-    IdemB -- "no" --> WriteB["save/delete"]
-    IdemC -- "no" --> WriteC["save/delete"]
-    IdemD -- "no" --> WriteD["save/delete"]
-    IdemE -- "no" --> WriteE["save/delete"]
+    IdemA -- "no" --> HealthA{"Store active or recovering?"}
+    IdemB -- "no" --> HealthB{"Store active or recovering?"}
+    IdemC -- "no" --> HealthC{"Store active or recovering?"}
+    IdemD -- "no" --> HealthD{"Store active or recovering?"}
+    IdemE -- "no" --> HealthE{"Store active or recovering?"}
+
+    HealthA -- "yes" --> WriteA["save/delete"]
+    HealthB -- "yes" --> WriteB["save/delete"]
+    HealthC -- "yes" --> WriteC["save/delete"]
+    HealthD -- "yes" --> WriteD["save/delete"]
+    HealthE -- "yes" --> WriteE["save/delete"]
+
+    HealthA -- "paused/open" --> HealthFailA["Store failure"]
+    HealthB -- "paused/open" --> HealthFailB["Store failure"]
+    HealthC -- "paused/open" --> HealthFailC["Store failure"]
+    HealthD -- "paused/open" --> HealthFailD["Store failure"]
+    HealthE -- "paused/open" --> HealthFailE["Store failure"]
 
     WriteA --> MarkA["Mark processed"]
     WriteB --> MarkB["Mark processed"]
@@ -88,6 +100,11 @@ graph TD
     SkipC --> Result
     SkipD --> Result
     SkipE --> Result
+    HealthFailA --> Result
+    HealthFailB --> Result
+    HealthFailC --> Result
+    HealthFailD --> Result
+    HealthFailE --> Result
 
     Result -- "no" --> Ack["XACK stream record"]
     Ack --> MetricsOK["Telemetry: processed, latency, queue gauges"]
@@ -95,6 +112,34 @@ graph TD
     Result -- "yes" --> NoAck["Do not ack"]
     NoAck --> PEL["Redis Pending Entries List"]
     PEL --> MetricsFail["Telemetry: store failures"]
+```
+
+## Store Health Flow
+
+```mermaid
+graph TD
+    Failure["Store call failure"] --> Count["Record failure in rolling window"]
+    Count --> Threshold{"Failures >= threshold?"}
+    Threshold -- "no" --> Degraded["State DEGRADED"]
+    Threshold -- "yes" --> Open["State OPEN_CIRCUIT"]
+
+    Open --> Wait["Skip store calls until open-duration elapses"]
+    Wait --> Recovering["State RECOVERING"]
+    Recovering --> Probe["Allow probe store calls"]
+    Probe --> ProbeResult{"Probe success?"}
+
+    ProbeResult -- "yes" --> ProbeCount["Increment probe successes"]
+    ProbeCount --> Close{"Successes >= probe-success-threshold?"}
+    Close -- "yes" --> Active["State ACTIVE"]
+    Close -- "no" --> Recovering
+
+    ProbeResult -- "no" --> Open
+
+    Operator["Operator"] --> Pause["pause(entity, store)"]
+    Pause --> Paused["State PAUSED"]
+    Paused --> Skipped["Skip store calls into retry/DLQ path"]
+    Operator --> Resume["resume(entity, store)"]
+    Resume --> Active
 ```
 
 ## Pending Retry And Per-Store DLQ Flow
@@ -144,11 +189,16 @@ graph TD
     Query -- "replayFailedStore(entity, recordId)" --> ReplayFailed["Read DLQ record - use failedStore as target"]
     Query -- "replayByStore(entity, mysql)" --> ReplayStore["Replay all DLQ records where failedStore=mysql"]
     Query -- "replayAllFailedStores(entity)" --> ReplayAll["Replay every store-specific DLQ record"]
+    Query -- "replayByStoreIfHealthy(...)" --> ReplayHealthy["Return KinexisReplayResult for replayed or skipped records"]
     Query -- "replayWithNewEventId(...)" --> NewEvent["Generate new eventId"]
 
-    ReplayFailed --> Preserve{"Normal replay?"}
-    ReplayStore --> Preserve
-    ReplayAll --> Preserve
+    ReplayFailed --> HealthCheck{"failedStore healthy or force option?"}
+    ReplayStore --> HealthCheck
+    ReplayAll --> HealthCheck
+    ReplayHealthy --> HealthCheck
+
+    HealthCheck -- "paused/open and not forced" --> Skipped["KinexisReplayResult - SKIPPED_UNHEALTHY_STORE"]
+    HealthCheck -- "healthy or forced" --> Preserve{"Normal replay?"}
 
     Preserve -- "yes" --> SameEvent["Preserve original eventId"]
     Preserve -- "no" --> NewEvent
@@ -163,6 +213,7 @@ graph TD
     Idempotency --> RetryFailedOnly["Failed store is retried"]
 
     AppendReplay --> ReplayTelemetry["Telemetry: dlq.replays - failedStore, targets, eventIdMode"]
+    Skipped --> ReplayFailure
     DlqService --> ReplayFailure["Telemetry: dlq.replay.failures"]
 ```
 

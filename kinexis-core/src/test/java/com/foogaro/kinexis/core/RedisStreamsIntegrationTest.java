@@ -12,6 +12,10 @@ import com.foogaro.kinexis.core.listener.AbstractStreamListener;
 import com.foogaro.kinexis.core.model.CachingPattern;
 import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisEvent;
+import com.foogaro.kinexis.core.model.KinexisReplayOptions;
+import com.foogaro.kinexis.core.model.KinexisReplayResult;
+import com.foogaro.kinexis.core.model.KinexisReplayStatus;
+import com.foogaro.kinexis.core.model.KinexisStoreHealthState;
 import com.foogaro.kinexis.core.processor.AbstractProcessor;
 import com.foogaro.kinexis.core.processor.KinexisProcessingCoordinator;
 import com.foogaro.kinexis.core.processor.KinexisProcessingMetrics;
@@ -31,6 +35,7 @@ import com.foogaro.kinexis.core.service.BeanFinder;
 import com.foogaro.kinexis.core.service.KinexisDlqService;
 import com.foogaro.kinexis.core.service.KinexisDiagnosticsService;
 import com.foogaro.kinexis.core.service.KinexisEntityRegistry;
+import com.foogaro.kinexis.core.service.KinexisStoreControl;
 import com.foogaro.kinexis.core.service.KinexisStoreValidator;
 import com.foogaro.kinexis.core.stream.RedisStreamEventPublisher;
 import com.foogaro.kinexis.core.service.KinexisService;
@@ -174,6 +179,110 @@ class RedisStreamsIntegrationTest {
         assertThrows(ProcessMessageException.class, () -> processor.process(failedRecord));
         KinexisTelemetrySnapshot failureSnapshot = telemetry.snapshot();
         assertEquals(1, counter(failureSnapshot, KinexisTelemetry.STORE_FAILURES, "exception", IllegalStateException.class.getName()));
+    }
+
+    @Test
+    void storeControlPauseSkipsStoreUntilResumed() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(new KinexisProperties(), telemetry);
+        inject(processor, "telemetry", telemetry);
+        inject(processor, "storeControl", storeControl);
+
+        storeControl.pause(TestEntity.class, "backing");
+
+        MapRecord<String, String, String> pausedRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                63L,
+                objectMapper.writeValueAsString(new TestEntity(63L, "Paused"))));
+
+        ProcessMessageException paused = assertThrows(ProcessMessageException.class, () -> processor.process(pausedRecord));
+        assertEquals(List.of("backing"), paused.getFailedStores());
+        assertTrue(backingStore.findById(63L).isEmpty());
+        assertEquals(KinexisStoreHealthState.PAUSED, storeControl.status(TestEntity.class, "backing").state());
+
+        storeControl.resume(TestEntity.class, "backing");
+        MapRecord<String, String, String> resumedRecord = streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                64L,
+                objectMapper.writeValueAsString(new TestEntity(64L, "Resumed"))));
+        processor.process(resumedRecord);
+
+        assertEquals(Optional.of(new TestEntity(64L, "Resumed")), backingStore.findById(64L));
+        assertEquals(KinexisStoreHealthState.ACTIVE, storeControl.status(TestEntity.class, "backing").state());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_PAUSED, Map.of("store", "backing")));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_RESUMED, Map.of("store", "backing")));
+        assertEquals(1, gauge(snapshot, KinexisTelemetry.STORE_HEALTH_STATE,
+                Map.of("store", "backing", "state", KinexisStoreHealthState.ACTIVE.name())));
+    }
+
+    @Test
+    void storeControlOpensCircuitAfterFailureThreshold() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStoreHealth().setFailureThreshold(2);
+        properties.getStoreHealth().setOpenDuration(Duration.ofDays(1));
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        inject(processor, "telemetry", telemetry);
+        inject(processor, "storeControl", storeControl);
+
+        backingStore.failSaves = true;
+        assertThrows(ProcessMessageException.class, () -> processor.process(streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                65L,
+                objectMapper.writeValueAsString(new TestEntity(65L, "FirstFailure"))))));
+        assertEquals(KinexisStoreHealthState.DEGRADED, storeControl.status(TestEntity.class, "backing").state());
+
+        assertThrows(ProcessMessageException.class, () -> processor.process(streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                66L,
+                objectMapper.writeValueAsString(new TestEntity(66L, "SecondFailure"))))));
+        assertEquals(KinexisStoreHealthState.OPEN_CIRCUIT, storeControl.status(TestEntity.class, "backing").state());
+
+        backingStore.failSaves = false;
+        assertThrows(ProcessMessageException.class, () -> processor.process(streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                67L,
+                objectMapper.writeValueAsString(new TestEntity(67L, "StillOpen"))))));
+        assertTrue(backingStore.findById(67L).isEmpty());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_CIRCUIT_OPENED, Map.of("store", "backing")));
+        assertEquals(1, gauge(snapshot, KinexisTelemetry.STORE_HEALTH_STATE,
+                Map.of("store", "backing", "state", KinexisStoreHealthState.OPEN_CIRCUIT.name())));
+    }
+
+    @Test
+    void storeControlRecoversAfterOpenDurationAndSuccessfulProbe() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStoreHealth().setFailureThreshold(1);
+        properties.getStoreHealth().setOpenDuration(Duration.ZERO);
+        properties.getStoreHealth().setProbeSuccessThreshold(1);
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        inject(processor, "telemetry", telemetry);
+        inject(processor, "storeControl", storeControl);
+
+        backingStore.failSaves = true;
+        assertThrows(ProcessMessageException.class, () -> processor.process(streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                68L,
+                objectMapper.writeValueAsString(new TestEntity(68L, "Open"))))));
+        assertEquals(KinexisStoreHealthState.RECOVERING, storeControl.status(TestEntity.class, "backing").state());
+
+        backingStore.failSaves = false;
+        processor.process(streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                69L,
+                objectMapper.writeValueAsString(new TestEntity(69L, "Recovered")))));
+
+        assertEquals(Optional.of(new TestEntity(69L, "Recovered")), backingStore.findById(69L));
+        assertEquals(KinexisStoreHealthState.ACTIVE, storeControl.status(TestEntity.class, "backing").state());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_PROBE_SUCCESSES, Map.of("store", "backing")));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_CIRCUIT_CLOSED, Map.of("store", "backing")));
     }
 
     @Test
@@ -374,13 +483,16 @@ class RedisStreamsIntegrationTest {
         EntityStoreRegistry registry = new DefaultEntityStoreRegistry(
                 List.of(explicitBackingStore, explicitCacheStore),
                 new EmptyEntityStoreRegistry());
+        KinexisStoreControl storeControl = new KinexisStoreControl(new KinexisProperties());
+        storeControl.pause(TestEntity.class, "explicitBacking");
         KinexisDiagnosticsService diagnosticsService = new KinexisDiagnosticsService(
                 List.of(explicitBackingStore, explicitCacheStore),
                 List.of(processor),
                 List.of(),
                 List.of(),
                 registry,
-                new AnnotationFinder());
+                new AnnotationFinder(),
+                storeControl);
 
         KinexisDiagnosticsService.EntityDiagnostics diagnostics = diagnosticsService.entity(TestEntity.class);
 
@@ -391,6 +503,7 @@ class RedisStreamsIntegrationTest {
         assertEquals("explicitCache", diagnostics.cacheStore().orElseThrow().name());
         assertEquals("explicitBacking", diagnostics.primaryStore().orElseThrow().name());
         assertEquals(List.of("explicitBacking"), diagnostics.targetStores().stream().map(KinexisDiagnosticsService.StoreDiagnostics::name).toList());
+        assertEquals(KinexisStoreHealthState.PAUSED, diagnostics.primaryStore().orElseThrow().health().state());
     }
 
     @Test
@@ -1017,6 +1130,91 @@ class RedisStreamsIntegrationTest {
     }
 
     @Test
+    void dlqReplayFailedStoreSkipsPausedStoreUnlessForced() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(new KinexisProperties(), telemetry);
+        String dlqRecordId = addDlqRecord(16L, "GuardedReplay", "mysql");
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate, telemetry, storeControl);
+
+        storeControl.pause(TestEntity.class, "mysql");
+
+        KinexisReplayResult skipped = dlqService.replayFailedStoreResult(TestEntity.class, dlqRecordId);
+
+        assertEquals(KinexisReplayStatus.SKIPPED_UNHEALTHY_STORE, skipped.status());
+        assertEquals("mysql", skipped.failedStore());
+        assertEquals("unhealthyStore:" + KinexisStoreHealthState.PAUSED.name(), skipped.reason());
+        assertTrue(dlqService.replayFailedStore(TestEntity.class, dlqRecordId).isEmpty());
+        List<MapRecord<String, Object, Object>> streamRecordsBeforeForce = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(streamRecordsBeforeForce);
+        assertTrue(streamRecordsBeforeForce.isEmpty());
+
+        KinexisReplayResult forced = dlqService.replayFailedStoreResult(
+                TestEntity.class,
+                dlqRecordId,
+                KinexisDlqService.ReplayMode.REPLAY_ONLY,
+                KinexisReplayOptions.forced());
+
+        assertEquals(KinexisReplayStatus.REPLAYED, forced.status());
+        assertNotNull(forced.replayedRecordId());
+        MapRecord<String, String, String> replayRecord = streamRecordById(forced.replayedRecordId());
+        assertEquals("mysql", replayRecord.getValue().get(KinexisEvent.EVENT_TARGETS_KEY));
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(2, counter(snapshot, KinexisTelemetry.DLQ_REPLAY_FAILURES,
+                "reason", "unhealthyStore:" + KinexisStoreHealthState.PAUSED.name()));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.DLQ_REPLAYS, "failedStore", "mysql"));
+    }
+
+    @Test
+    void dlqReplayAllHealthyFailedStoresSkipsUnhealthyStores() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(new KinexisProperties(), telemetry);
+        addDlqRecord(17L, "MysqlPaused", "mysql");
+        addDlqRecord(18L, "SqlServerHealthy", "sqlserver");
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate, telemetry, storeControl);
+
+        storeControl.pause(TestEntity.class, "mysql");
+
+        List<KinexisReplayResult> results = dlqService.replayAllHealthyFailedStores(TestEntity.class);
+
+        assertEquals(2, results.size());
+        Map<String, KinexisReplayStatus> statusByStore = results.stream()
+                .collect(java.util.stream.Collectors.toMap(KinexisReplayResult::failedStore, KinexisReplayResult::status));
+        assertEquals(KinexisReplayStatus.SKIPPED_UNHEALTHY_STORE, statusByStore.get("mysql"));
+        assertEquals(KinexisReplayStatus.REPLAYED, statusByStore.get("sqlserver"));
+        assertTrue(dlqService.replayByStore(TestEntity.class, "mysql").isEmpty());
+        assertEquals(1, dlqService.replayByStoreIfHealthy(TestEntity.class, "mysql").size());
+
+        List<MapRecord<String, Object, Object>> streamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(streamRecords);
+        assertEquals(1, streamRecords.size());
+        assertEquals("sqlserver", streamRecords.getFirst().getValue().get(KinexisEvent.EVENT_TARGETS_KEY));
+    }
+
+    @Test
+    void dlqWriterUsesStoreHealthReasonForPausedStore() throws Exception {
+        KinexisStoreControl storeControl = new KinexisStoreControl(new KinexisProperties());
+        inject(processor, "storeControl", storeControl);
+        storeControl.pause(TestEntity.class, "backing");
+        enqueueAndRead(KinexisEvent.save(
+                TestEntity.class,
+                19L,
+                objectMapper.writeValueAsString(new TestEntity(19L, "PausedDlq"))));
+        TestPendingMessageHandler handler = pendingHandler(processor, 1);
+
+        handler.processPendingMessages();
+
+        List<MapRecord<String, Object, Object>> dlqRecords = redisTemplate.opsForStream()
+                .range(Misc.getDLQStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(dlqRecords);
+        assertEquals(1, dlqRecords.size());
+        assertEquals("Store paused", dlqRecords.getFirst().getValue().get(AbstractPendingMessageHandler.DLQ_REASON_KEY));
+        assertEquals("backing", dlqRecords.getFirst().getValue().get(AbstractPendingMessageHandler.DLQ_FAILED_STORE_KEY));
+    }
+
+    @Test
     void dlqServiceReplaysDeadLetterMessageToOriginalStream() throws Exception {
         backingStore.failSaves = true;
         MapRecord<String, String, String> originalRecord = enqueueAndRead(KinexisEvent.save(TestEntity.class, objectMapper.writeValueAsString(new TestEntity(8L, "Replay"))));
@@ -1170,6 +1368,29 @@ class RedisStreamsIntegrationTest {
                 .withId(RecordId.autoGenerate())
                 .ofMap(event.toRecordMap())
                 .withStreamKey(Misc.getStreamKey(TestEntity.class));
+    }
+
+    private String addDlqRecord(long entityId, String name, String failedStore) throws Exception {
+        Map<String, String> dlqRecord = new java.util.HashMap<>(KinexisEvent.save(
+                TestEntity.class,
+                entityId,
+                objectMapper.writeValueAsString(new TestEntity(entityId, name)),
+                failedStore).toRecordMap());
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_REASON_KEY, "manual");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_STREAM_KEY, Misc.getStreamKey(TestEntity.class));
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_STREAM_ID_KEY, entityId + "-0");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_CONSUMER_KEY, "test-consumer");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_GROUP_KEY, "test-group");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_ATTEMPTS_KEY, "1");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_FAILED_STORE_KEY, failedStore);
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_EXCEPTION_CLASS_KEY, IllegalStateException.class.getName());
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_FAILURE_TIMESTAMP_KEY, java.time.Instant.now().toString());
+        RecordId recordId = redisTemplate.opsForStream().add(StreamRecords.newRecord()
+                .withId(RecordId.autoGenerate())
+                .ofMap(dlqRecord)
+                .withStreamKey(Misc.getDLQStreamKey(TestEntity.class)));
+        assertNotNull(recordId);
+        return recordId.getValue();
     }
 
     private void processUnchecked(MapRecord<String, String, String> record) {
