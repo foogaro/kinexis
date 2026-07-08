@@ -97,6 +97,24 @@
       "defaultValue": "100ms"
     },
     {
+      "name": "kinexis.event-schema.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Enables event schema evolution and upcasting before stream processing and DLQ replay.",
+      "defaultValue": true
+    },
+    {
+      "name": "kinexis.event-schema.current-version",
+      "type": "java.lang.String",
+      "description": "Default current Kinexis event schema version used when an entity-specific version is not configured.",
+      "defaultValue": "1"
+    },
+    {
+      "name": "kinexis.event-schema.entity-versions",
+      "type": "java.util.Map<java.lang.String, java.lang.String>",
+      "description": "Per-entity current event schema versions keyed by fully qualified entity class name.",
+      "defaultValue": {}
+    },
+    {
       "name": "kinexis.store-health.enabled",
       "type": "java.lang.Boolean",
       "description": "Enables per-store health state, manual pause/resume, and automatic circuit breaking for target stores.",

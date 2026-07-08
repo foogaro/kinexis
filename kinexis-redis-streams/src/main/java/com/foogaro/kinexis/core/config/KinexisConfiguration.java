@@ -5,9 +5,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.foogaro.kinexis.core.handler.KinexisDlqWriter;
 import com.foogaro.kinexis.core.service.AnnotationFinder;
 import com.foogaro.kinexis.core.service.BeanFinder;
+import com.foogaro.kinexis.core.service.DefaultKinexisEventSchemaRegistry;
 import com.foogaro.kinexis.core.service.KinexisDlqService;
 import com.foogaro.kinexis.core.service.KinexisDiagnosticsService;
 import com.foogaro.kinexis.core.service.KinexisEntityRegistry;
+import com.foogaro.kinexis.core.service.KinexisEventSchemaRegistry;
+import com.foogaro.kinexis.core.service.KinexisEventUpcaster;
 import com.foogaro.kinexis.core.service.KinexisService;
 import com.foogaro.kinexis.core.service.KinexisStoreControl;
 import com.foogaro.kinexis.core.service.KinexisStoreValidator;
@@ -216,8 +219,9 @@ public class KinexisConfiguration {
     @ConditionalOnMissingBean
     public EventPublisher eventPublisher(@Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate,
                                          StreamPartitioner streamPartitioner,
-                                         KinexisTelemetry telemetry) {
-        return new RedisStreamEventPublisher(redisTemplate, streamPartitioner, telemetry);
+                                         KinexisTelemetry telemetry,
+                                         KinexisEventSchemaRegistry eventSchemaRegistry) {
+        return new RedisStreamEventPublisher(redisTemplate, streamPartitioner, telemetry, eventSchemaRegistry);
     }
 
     @Bean
@@ -243,6 +247,17 @@ public class KinexisConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
+    public KinexisEventSchemaRegistry kinexisEventSchemaRegistry(KinexisProperties properties,
+                                                                 ObjectProvider<KinexisEventUpcaster> upcasters) {
+        return new DefaultKinexisEventSchemaRegistry(
+                properties.getEventSchema().isEnabled(),
+                properties.getEventSchema().getCurrentVersion(),
+                properties.getEventSchema().getEntityVersions(),
+                upcasters.orderedStream().toList());
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
     public KinexisTelemetry kinexisTelemetry(ListableBeanFactory beanFactory) {
         ArrayList<KinexisTelemetry> telemetry = new ArrayList<>();
         telemetry.add(new SimpleKinexisTelemetry());
@@ -254,8 +269,9 @@ public class KinexisConfiguration {
     @ConditionalOnMissingBean
     public KinexisDlqService kinexisDlqService(@Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate,
                                                KinexisTelemetry telemetry,
-                                               KinexisStoreControl storeControl) {
-        return new KinexisDlqService(redisTemplate, telemetry, storeControl);
+                                               KinexisStoreControl storeControl,
+                                               KinexisEventSchemaRegistry eventSchemaRegistry) {
+        return new KinexisDlqService(redisTemplate, telemetry, storeControl, eventSchemaRegistry);
     }
 
     @Bean

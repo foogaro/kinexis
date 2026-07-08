@@ -8,8 +8,10 @@ import com.foogaro.kinexis.core.exception.AcknowledgeMessageException;
 import com.foogaro.kinexis.core.exception.KinexisBackpressureException;
 import com.foogaro.kinexis.core.exception.KinexisStoreUnavailableException;
 import com.foogaro.kinexis.core.exception.ProcessMessageException;
+import com.foogaro.kinexis.core.model.KinexisEventEnvelope;
 import com.foogaro.kinexis.core.model.KinexisEvent;
 import com.foogaro.kinexis.core.model.KinexisStoreHealthState;
+import com.foogaro.kinexis.core.service.KinexisEventSchemaRegistry;
 import com.foogaro.kinexis.core.service.KinexisStoreControl;
 import com.foogaro.kinexis.core.store.EntityStore;
 import com.foogaro.kinexis.core.store.EntityStoreRegistry;
@@ -68,6 +70,9 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
 
     @Autowired(required = false)
     private KinexisStoreControl storeControl;
+
+    @Autowired(required = false)
+    private KinexisEventSchemaRegistry eventSchemaRegistry;
 
     @Autowired(required = false)
     private KinexisTelemetry telemetry;
@@ -183,19 +188,37 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
     }
 
     private ProcessingContext<T> processingContext(MapRecord<String, String, String> record) throws JsonProcessingException {
-        String content = record.getValue().get(EVENT_CONTENT_KEY);
-        String operation = record.getValue().get(EVENT_OPERATION_KEY);
-        String eventId = KinexisEvent.eventId(record.getValue(), record.getId().getValue());
-        List<String> targets = KinexisEvent.targets(record.getValue());
+        KinexisEventEnvelope envelope = eventSchemaRegistry().upcast(KinexisEventEnvelope.from(
+                record.getValue(),
+                record.getId().getValue(),
+                getEntityClass()));
+        recordUpcastTelemetry(record, envelope);
+        Map<String, String> values = envelope.toRecordMap();
+        String content = values.get(EVENT_CONTENT_KEY);
+        String operation = values.get(EVENT_OPERATION_KEY);
+        String eventId = KinexisEvent.eventId(values, record.getId().getValue());
+        List<String> targets = KinexisEvent.targets(values);
         if (Misc.Operation.DELETE.getValue().equals(operation)) {
-            String entityId = KinexisEvent.entityId(record.getValue()).orElse(content);
+            String entityId = KinexisEvent.entityId(values).orElse(content);
             return new ProcessingContext<>(eventId, entityId, operation, content, targets, null);
         }
         T entity = convertToEntity(content);
-        String entityId = KinexisEvent.entityId(record.getValue())
+        String entityId = KinexisEvent.entityId(values)
                 .or(() -> Misc.getEntityId(entity).map(String::valueOf))
                 .orElse(null);
         return new ProcessingContext<>(eventId, entityId, operation, content, targets, entity);
+    }
+
+    private void recordUpcastTelemetry(MapRecord<String, String, String> record, KinexisEventEnvelope envelope) {
+        String originalVersion = record.getValue().getOrDefault(KinexisEvent.EVENT_SCHEMA_VERSION_KEY, KinexisEvent.CURRENT_SCHEMA_VERSION);
+        if (originalVersion.equals(envelope.schemaVersion())) {
+            return;
+        }
+        telemetry().increment(KinexisTelemetry.STREAM_EVENTS_UPCASTED, Map.of(
+                "entity", getEntityClass().getSimpleName(),
+                "stream", record.getStream(),
+                "fromVersion", originalVersion,
+                "toVersion", envelope.schemaVersion()));
     }
 
     private void fanOut(MapRecord<String, String, String> record,
@@ -338,6 +361,13 @@ public abstract class AbstractProcessor<T> implements Processor<T> {
             storeControl = new KinexisStoreControl(new KinexisProperties(), telemetry());
         }
         return storeControl;
+    }
+
+    private KinexisEventSchemaRegistry eventSchemaRegistry() {
+        if (eventSchemaRegistry == null) {
+            eventSchemaRegistry = KinexisEventSchemaRegistry.noop();
+        }
+        return eventSchemaRegistry;
     }
 
     private KinexisTelemetry telemetry() {

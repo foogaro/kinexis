@@ -27,7 +27,7 @@ Prefer the BOM when using split modules:
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.3.0</version>
+            <version>2.4.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -60,7 +60,7 @@ If you prefer the compatibility bundle:
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.3.0</version>
+    <version>2.4.0</version>
 </dependency>
 ```
 
@@ -373,14 +373,53 @@ For `findById(id)`:
 For `save(entity)` or `delete(id)` with write-behind:
 
 1. Kinexis validates target stores.
-2. It appends a `KinexisEvent` to a Redis Stream partition.
+2. It appends a schema-versioned `KinexisEvent` to a Redis Stream partition.
 3. A stream listener reads the event.
-4. The processor fans out to matching `EntityStore` beans in parallel.
-5. Successful stores are marked processed using `{eventId, storeName}` idempotency.
-6. Failed stores remain pending and are retried.
-7. After retry exhaustion, Kinexis writes one DLQ record per failed store.
+4. The processor upcasts old event envelopes before deserializing entity content.
+5. The processor fans out to matching `EntityStore` beans in parallel.
+6. Successful stores are marked processed using `{eventId, storeName}` idempotency.
+7. Failed stores remain pending and are retried.
+8. After retry exhaustion, Kinexis writes one DLQ record per failed store.
 
 If MySQL succeeds, PostgreSQL fails, and the retry limit is reached, only PostgreSQL gets a DLQ record. A normal replay preserves the original `eventId`, so MySQL is not written again.
+
+## Event Schema Evolution
+
+Use event schema evolution when a deployed entity payload shape changes while Redis Streams or DLQ records may still contain older payloads.
+
+```properties
+kinexis.event-schema.enabled=true
+kinexis.event-schema.current-version=2
+kinexis.event-schema.entity-versions.com.example.Employer=2
+```
+
+Register one or more `KinexisEventUpcaster` beans. Kinexis calls them before processor deserialization and before DLQ replay appends the record back to the entity stream.
+
+```java
+import com.foogaro.kinexis.core.model.KinexisEventEnvelope;
+import com.foogaro.kinexis.core.service.KinexisEventUpcaster;
+import org.springframework.stereotype.Component;
+
+@Component
+public class EmployerV1ToV2Upcaster implements KinexisEventUpcaster {
+
+    @Override
+    public boolean supports(String entityType, String fromVersion, String toVersion) {
+        return Employer.class.getName().equals(entityType)
+                && "1".equals(fromVersion)
+                && "2".equals(toVersion);
+    }
+
+    @Override
+    public KinexisEventEnvelope upcast(KinexisEventEnvelope envelope, String toVersion) {
+        return envelope
+                .withContent(envelope.content().replace("\"legacyName\"", "\"name\""))
+                .withSchemaVersion("2");
+    }
+}
+```
+
+New events are stamped with the current schema version. Old events are migrated through the registry; if no matching upcaster exists, processing fails and the normal pending retry and DLQ behavior applies.
 
 ## Store Health
 
@@ -443,6 +482,7 @@ Useful metrics include:
 | --- | --- |
 | `kinexis.stream.events.published` | Events appended to Redis Streams. |
 | `kinexis.stream.events.processed` | Events processed successfully. |
+| `kinexis.stream.events.upcasted` | Old stream or DLQ records migrated to the current schema version. |
 | `kinexis.store.write.latency` | Store save/delete latency by store and operation. |
 | `kinexis.store.failures` | Store failures by exception class. |
 | `kinexis.pending.retries` | Pending retry pressure. |

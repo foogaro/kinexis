@@ -7,6 +7,7 @@ public class KinexisProperties {
     private final Stream stream = new Stream();
     private final Stores stores = new Stores();
     private final Processing processing = new Processing();
+    private final EventSchema eventSchema = new EventSchema();
     private final StoreHealth storeHealth = new StoreHealth();
     private final Validation validation = new Validation();
 
@@ -20,6 +21,10 @@ public class KinexisProperties {
 
     public Processing getProcessing() {
         return processing;
+    }
+
+    public EventSchema getEventSchema() {
+        return eventSchema;
     }
 
     public StoreHealth getStoreHealth() {
@@ -159,6 +164,37 @@ public class KinexisProperties {
         BLOCK,
         REJECT_TO_DLQ,
         SLOW_DOWN
+    }
+
+    public static class EventSchema {
+
+        private boolean enabled = true;
+        private String currentVersion = "1";
+        private java.util.Map<String, String> entityVersions = new java.util.HashMap<>();
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getCurrentVersion() {
+            return currentVersion;
+        }
+
+        public void setCurrentVersion(String currentVersion) {
+            this.currentVersion = currentVersion;
+        }
+
+        public java.util.Map<String, String> getEntityVersions() {
+            return entityVersions;
+        }
+
+        public void setEntityVersions(java.util.Map<String, String> entityVersions) {
+            this.entityVersions = entityVersions == null ? new java.util.HashMap<>() : entityVersions;
+        }
     }
 
     public static class StoreHealth {

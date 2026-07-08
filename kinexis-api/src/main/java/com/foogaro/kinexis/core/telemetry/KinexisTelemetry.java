@@ -7,6 +7,7 @@ public interface KinexisTelemetry {
 
     String STREAM_EVENTS_PUBLISHED = "kinexis.stream.events.published";
     String STREAM_EVENTS_PROCESSED = "kinexis.stream.events.processed";
+    String STREAM_EVENTS_UPCASTED = "kinexis.stream.events.upcasted";
     String STORE_WRITE_LATENCY = "kinexis.store.write.latency";
     String STORE_FAILURES = "kinexis.store.failures";
     String PENDING_RETRIES = "kinexis.pending.retries";

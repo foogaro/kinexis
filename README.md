@@ -15,7 +15,7 @@ Kinexis is split so applications can choose the smallest dependency surface that
 | Artifact | What it contains | Main dependency surface |
 | --- | --- | --- |
 | `kinexis-bom` | Maven BOM for aligning all Kinexis split module versions. | No runtime dependencies. |
-| `kinexis-api` | `@CachingPatterns`, events, store interfaces, default registries, exceptions, telemetry contracts, and `KinexisProperties`. | No compile dependencies. |
+| `kinexis-api` | `@CachingPatterns`, events, event schema evolution contracts, store interfaces, default registries, exceptions, telemetry contracts, and `KinexisProperties`. | No compile dependencies. |
 | `kinexis-spring` | `KinexisService<T>`, annotation inspection, Spring bean discovery, Spring Data `CrudRepository` adapters, and optional Micrometer bridge. | Spring Context, Spring Data Commons, Jackson. |
 | `kinexis-redis-streams` | Redis Streams publisher, generated-listener base classes, processors, pending retry, DLQ, replay, idempotency, partitioning, backpressure, validation, diagnostics, and Spring Redis configuration. | Spring Data Redis, Lettuce, Spring Boot autoconfigure. |
 | `kinexis-redis-om` | Redis OM cache adapter and the annotation processor that generates Redis OM repositories plus entity stream components. | Redis OM Spring, JavaPoet, Kinexis Redis Streams runtime. |
@@ -35,6 +35,7 @@ Existing imports remain stable. Even when using the split modules, public classe
 | Partitioned streams | Routes events by `entityId` across partitioned Redis Streams while keeping each entity on a stable partition. |
 | Per-entity ordering | Serializes records for the same entity ID inside the application instance. |
 | Idempotency | Skips a store write when the same `{eventId, storeName}` has already succeeded. |
+| Event schema evolution | Publishes versioned events and upcasts old Redis Stream or DLQ records before processing or replay. |
 | Pending retry | Reprocesses pending Redis Stream records using configurable retry limits. |
 | Per-store DLQ and replay | Moves exhausted failures to a dead-letter stream per failed store, lists records through a typed DTO, and replays all records, one store, or one failed-store record. |
 | Backpressure | Bounds in-flight records and executor queue depth, with block, slow-down, or reject-to-DLQ behavior. |
@@ -56,7 +57,7 @@ Use `kinexis-bom` to align split module versions from one place.
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.3.0</version>
+            <version>2.4.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -85,7 +86,7 @@ Use `kinexis-core` when you want the same one-dependency setup as earlier releas
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.3.0</version>
+    <version>2.4.0</version>
 </dependency>
 ```
 
@@ -99,7 +100,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.3.0</version>
+    <version>2.4.0</version>
 </dependency>
 ```
 
@@ -113,12 +114,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.3.0</version>
+    <version>2.4.0</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.3.0</version>
+    <version>2.4.0</version>
 </dependency>
 ```
 
@@ -130,7 +131,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.3.0</version>
+    <version>2.4.0</version>
 </dependency>
 ```
 
@@ -143,7 +144,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.3.0</version>
+        <version>2.4.0</version>
     </path>
 </annotationProcessorPaths>
 ```
@@ -613,6 +614,56 @@ kinexis.store-health.probe-success-threshold=3
 kinexis.store-health.failure-window=5m
 ```
 
+## Event Schema Evolution
+
+Redis Streams and DLQ records are durable. They can outlive the deployment that created them, so Kinexis treats `schemaVersion` as operational metadata instead of a passive field.
+
+Kinexis uses three contracts:
+
+| Contract | Purpose |
+| --- | --- |
+| `KinexisEventEnvelope` | Immutable wrapper around the Redis Stream record map. Upcasters modify the envelope and return a new one. |
+| `KinexisEventUpcaster` | Application-provided adapter that migrates one old event payload shape toward the configured current schema version. |
+| `KinexisEventSchemaRegistry` | Resolves the current schema version per entity type and applies registered upcasters before processing or DLQ replay. |
+
+When an application publishes a new write-behind event, `RedisStreamEventPublisher` stamps the record with the current schema version from `KinexisEventSchemaRegistry`. When a processor reads an older Redis Stream record, Kinexis upcasts the envelope before JSON deserialization. When `KinexisDlqService` replays an older DLQ record, Kinexis upcasts the replay message before appending it back to the entity stream.
+
+Configure the default current version and optional entity-specific versions:
+
+```properties
+kinexis.event-schema.enabled=true
+kinexis.event-schema.current-version=2
+kinexis.event-schema.entity-versions.com.foogaro.demo.Employer=2
+```
+
+Register upcasters as plain beans. This example renames `legacyName` to `name` for `Employer` events created with schema `1`:
+
+```java
+import com.foogaro.kinexis.core.model.KinexisEventEnvelope;
+import com.foogaro.kinexis.core.service.KinexisEventUpcaster;
+import org.springframework.stereotype.Component;
+
+@Component
+public class EmployerV1ToV2Upcaster implements KinexisEventUpcaster {
+
+    @Override
+    public boolean supports(String entityType, String fromVersion, String toVersion) {
+        return Employer.class.getName().equals(entityType)
+                && "1".equals(fromVersion)
+                && "2".equals(toVersion);
+    }
+
+    @Override
+    public KinexisEventEnvelope upcast(KinexisEventEnvelope envelope, String toVersion) {
+        return envelope
+                .withContent(envelope.content().replace("\"legacyName\"", "\"name\""))
+                .withSchemaVersion("2");
+    }
+}
+```
+
+If an old record requires migration and no matching upcaster exists, processing fails normally. The record remains pending and then follows the configured per-store retry and DLQ behavior. That failure is intentional: it prevents Kinexis from silently writing incorrectly deserialized data after an entity shape change.
+
 ## Telemetry
 
 `KinexisTelemetry` is dependency-light and lives in `kinexis-api`. The default runtime uses `SimpleKinexisTelemetry`. If Micrometer is already present and a `MeterRegistry` bean exists, `kinexis-spring` also forwards metrics to Micrometer through reflection.
@@ -623,6 +674,7 @@ Core metrics:
 | --- | --- | --- |
 | `kinexis.stream.events.published` | Counter | `entity`, `operation`, `stream` |
 | `kinexis.stream.events.processed` | Counter | `entity`, `operation`, `stream` |
+| `kinexis.stream.events.upcasted` | Counter | `entity`, `stream`, `fromVersion`, `toVersion` |
 | `kinexis.store.write.latency` | Timer | `entity`, `store`, `operation` |
 | `kinexis.store.failures` | Counter | `entity`, `store`, `operation`, `exception` |
 | `kinexis.pending.retries` | Counter | `entity`, `stream`, `group` |
@@ -888,6 +940,9 @@ This fallback uses generic Spring Data `CrudRepository` adapters. Register `Redi
 | `kinexis.processing.backpressure.executor-queue-size` | `1024` | Bounded queue size for asynchronous target-store work. |
 | `kinexis.processing.backpressure.queue-full-behavior` | `BLOCK` | Overload behavior: `BLOCK`, `SLOW_DOWN`, or `REJECT_TO_DLQ`. |
 | `kinexis.processing.backpressure.slow-down-delay` | `100ms` | Delay between capacity checks when behavior is `SLOW_DOWN`. |
+| `kinexis.event-schema.enabled` | `true` | Enables event envelope upcasting for Redis Stream processing and DLQ replay. |
+| `kinexis.event-schema.current-version` | `1` | Default current schema version stamped on new events and used as the upcast target. |
+| `kinexis.event-schema.entity-versions` | `{}` | Optional map of fully qualified entity class name to current schema version. |
 | `kinexis.store-health.enabled` | `true` | Enables per-store health state, pause/resume, and automatic circuit breaking. |
 | `kinexis.store-health.failure-threshold` | `10` | Failures inside the failure window before opening a store circuit. |
 | `kinexis.store-health.open-duration` | `60s` | Time an opened circuit stays closed to store calls before recovery probes. |
@@ -917,7 +972,7 @@ Run a demo module:
 ./mvnw -pl demo/kinexis-demo-psql -am test
 ```
 
-The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, store health controls, circuit breaking, partitioning, idempotency, telemetry, and generated-code compatibility.
+The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, store health controls, circuit breaking, partitioning, idempotency, event schema evolution, telemetry, and generated-code compatibility.
 
 ## Demo Projects
 
@@ -942,6 +997,7 @@ Kinexis keeps the API small:
 * `EntityStoreRegistry` resolves cache, primary, and target stores.
 * `EventPublisher` abstracts event publication.
 * `KinexisTelemetry` abstracts operational metrics.
+* `KinexisEventSchemaRegistry` and `KinexisEventUpcaster` keep durable stream and DLQ records readable after entity payload changes.
 * `KinexisDiagnosticsService` exposes runtime metadata.
 * `KinexisDlqService` handles operational replay.
 

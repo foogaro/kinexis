@@ -30,7 +30,8 @@ graph TD
 
     WriteBehind -- "yes" --> ValidateTargets["Validate target EntityStore beans"]
     ValidateTargets --> BuildEvent["Build KinexisEvent - operation, eventId, entityType, entityId, targets, content"]
-    BuildEvent --> Partition["StreamPartitioner routes by entityId"]
+    BuildEvent --> StampSchema["Stamp current schemaVersion from KinexisEventSchemaRegistry"]
+    StampSchema --> Partition["StreamPartitioner routes by entityId"]
     Partition --> RedisStream["Redis Stream partition - wb:stream:entity:entity:partition:n"]
     RedisStream --> Done
 ```
@@ -43,7 +44,12 @@ graph TD
     Listener --> Processor["AbstractProcessor"]
 
     Processor --> Capacity["Check max in-flight per stream"]
-    Capacity --> EntityOrder["Serialize local processing per entityId"]
+    Capacity --> Envelope["Create KinexisEventEnvelope"]
+    Envelope --> Upcast{"schemaVersion current?"}
+    Upcast -- "no" --> Registry["KinexisEventSchemaRegistry applies KinexisEventUpcaster beans"]
+    Upcast -- "yes" --> Deserialize["Deserialize current event content"]
+    Registry --> Deserialize
+    Deserialize --> EntityOrder["Serialize local processing per entityId"]
     EntityOrder --> ResolveStores["EntityStoreRegistry.findTargetStores(entity, targets)"]
 
     ResolveStores --> FanOut["Fan out to target stores in parallel"]
@@ -203,8 +209,9 @@ graph TD
     Preserve -- "yes" --> SameEvent["Preserve original eventId"]
     Preserve -- "no" --> NewEvent
 
-    SameEvent --> AppendReplay["Append replay message to original stream"]
-    NewEvent --> AppendReplay
+    NewEvent --> UpcastReplay["Upcast replay message to current schemaVersion"]
+    SameEvent --> UpcastReplay
+    UpcastReplay --> AppendReplay
 
     AppendReplay --> Processor["Processor consumes replayed event"]
 
@@ -224,6 +231,8 @@ graph LR
     subgraph API["kinexis-api"]
         Ann["@CachingPatterns"]
         Event["KinexisEvent"]
+        Envelope["KinexisEventEnvelope"]
+        Schema["KinexisEventSchemaRegistry / KinexisEventUpcaster"]
         Stores["EntityStore / CacheStore"]
         Registry["EntityStoreRegistry"]
         Telemetry["KinexisTelemetry"]
@@ -258,12 +267,15 @@ graph LR
     Service --> Publisher
     Registry --> Stores
 
+    Publisher --> Schema
     Publisher --> Partitioner
     Listener --> Processor
+    Processor --> Schema
     Processor --> Stores
     Processor --> Backpressure
     Pending --> Processor
     Pending --> DLQ
+    DLQ --> Schema
     DLQ --> Publisher
 
     RedisOmStore --> Stores

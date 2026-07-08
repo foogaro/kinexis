@@ -12,6 +12,7 @@ import com.foogaro.kinexis.core.listener.AbstractStreamListener;
 import com.foogaro.kinexis.core.model.CachingPattern;
 import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisEvent;
+import com.foogaro.kinexis.core.model.KinexisEventEnvelope;
 import com.foogaro.kinexis.core.model.KinexisReplayOptions;
 import com.foogaro.kinexis.core.model.KinexisReplayResult;
 import com.foogaro.kinexis.core.model.KinexisReplayStatus;
@@ -26,6 +27,7 @@ import com.foogaro.kinexis.core.store.CacheStore;
 import com.foogaro.kinexis.core.store.BeanFinderEntityStoreRegistry;
 import com.foogaro.kinexis.core.store.CrudRepositoryCacheStore;
 import com.foogaro.kinexis.core.store.CrudRepositoryEntityStore;
+import com.foogaro.kinexis.core.service.DefaultKinexisEventSchemaRegistry;
 import com.foogaro.kinexis.core.store.DefaultEntityStoreRegistry;
 import com.foogaro.kinexis.core.store.EmptyEntityStoreRegistry;
 import com.foogaro.kinexis.core.store.EntityStore;
@@ -35,6 +37,8 @@ import com.foogaro.kinexis.core.service.BeanFinder;
 import com.foogaro.kinexis.core.service.KinexisDlqService;
 import com.foogaro.kinexis.core.service.KinexisDiagnosticsService;
 import com.foogaro.kinexis.core.service.KinexisEntityRegistry;
+import com.foogaro.kinexis.core.service.KinexisEventSchemaRegistry;
+import com.foogaro.kinexis.core.service.KinexisEventUpcaster;
 import com.foogaro.kinexis.core.service.KinexisStoreControl;
 import com.foogaro.kinexis.core.service.KinexisStoreValidator;
 import com.foogaro.kinexis.core.stream.RedisStreamEventPublisher;
@@ -148,6 +152,25 @@ class RedisStreamsIntegrationTest {
     }
 
     @Test
+    void publisherUsesConfiguredCurrentSchemaVersion() throws Exception {
+        KinexisEventSchemaRegistry schemaRegistry = eventSchemaRegistry("2", new LegacyNameUpcaster());
+        RedisStreamEventPublisher publisher = new RedisStreamEventPublisher(
+                redisTemplate,
+                new StreamPartitioner(new KinexisProperties()),
+                new SimpleKinexisTelemetry(),
+                schemaRegistry);
+        TestEntity entity = new TestEntity(71L, "Current");
+
+        publisher.append(TestEntity.class, KinexisEvent.save(TestEntity.class, objectMapper.writeValueAsString(entity)));
+
+        List<MapRecord<String, Object, Object>> records = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(records);
+        assertEquals(1, records.size());
+        assertEquals("2", records.getFirst().getValue().get(EVENT_SCHEMA_VERSION_KEY));
+    }
+
+    @Test
     void telemetryRecordsPublishedProcessedStoreLatencyAndStoreFailures() throws Exception {
         SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
         RedisStreamEventPublisher publisher = new RedisStreamEventPublisher(
@@ -179,6 +202,42 @@ class RedisStreamsIntegrationTest {
         assertThrows(ProcessMessageException.class, () -> processor.process(failedRecord));
         KinexisTelemetrySnapshot failureSnapshot = telemetry.snapshot();
         assertEquals(1, counter(failureSnapshot, KinexisTelemetry.STORE_FAILURES, "exception", IllegalStateException.class.getName()));
+    }
+
+    @Test
+    void processorUpcastsOldSchemaEventBeforeDeserializingEntity() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        inject(processor, "telemetry", telemetry);
+        inject(processor, "eventSchemaRegistry", eventSchemaRegistry("2", new LegacyNameUpcaster()));
+        MapRecord<String, String, String> oldRecord = oldSchemaRecord(
+                70L,
+                "{\"id\":70,\"legacyName\":\"Upcasted\"}",
+                "1",
+                "backing");
+
+        processor.process(oldRecord);
+
+        assertEquals(Optional.of(new TestEntity(70L, "Upcasted")), backingStore.findById(70L));
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STREAM_EVENTS_UPCASTED, Map.of(
+                "entity", "TestEntity",
+                "fromVersion", "1",
+                "toVersion", "2")));
+    }
+
+    @Test
+    void processorFailsOldSchemaEventWhenNoUpcasterIsRegistered() throws Exception {
+        inject(processor, "eventSchemaRegistry", eventSchemaRegistry("2"));
+        MapRecord<String, String, String> oldRecord = oldSchemaRecord(
+                71L,
+                "{\"id\":71,\"legacyName\":\"MissingUpcaster\"}",
+                "1",
+                "backing");
+
+        ProcessMessageException exception = assertThrows(ProcessMessageException.class, () -> processor.process(oldRecord));
+
+        assertTrue(hasCause(exception, IllegalStateException.class));
+        assertTrue(backingStore.findById(71L).isEmpty());
     }
 
     @Test
@@ -1194,6 +1253,36 @@ class RedisStreamsIntegrationTest {
     }
 
     @Test
+    void dlqReplayUpcastsOldSchemaRecordBeforeAppendingToStream() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisEventSchemaRegistry schemaRegistry = eventSchemaRegistry("2", new LegacyNameUpcaster());
+        String dlqRecordId = addDlqRecord(
+                20L,
+                "{\"id\":20,\"legacyName\":\"ReplayUpcast\"}",
+                "mysql",
+                "1");
+        KinexisDlqService dlqService = new KinexisDlqService(
+                redisTemplate,
+                telemetry,
+                new KinexisStoreControl(new KinexisProperties(), telemetry),
+                schemaRegistry);
+
+        Optional<String> replayedId = dlqService.replayFailedStore(TestEntity.class, dlqRecordId);
+
+        assertTrue(replayedId.isPresent());
+        MapRecord<String, String, String> replayRecord = streamRecordById(replayedId.get());
+        assertEquals("2", replayRecord.getValue().get(KinexisEvent.EVENT_SCHEMA_VERSION_KEY));
+        assertEquals("mysql", replayRecord.getValue().get(KinexisEvent.EVENT_TARGETS_KEY));
+        assertTrue(replayRecord.getValue().get(EVENT_CONTENT_KEY).contains("\"name\":\"ReplayUpcast\""));
+        assertFalse(replayRecord.getValue().get(EVENT_CONTENT_KEY).contains("legacyName"));
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STREAM_EVENTS_UPCASTED, Map.of(
+                "entity", "TestEntity",
+                "fromVersion", "1",
+                "toVersion", "2")));
+    }
+
+    @Test
     void dlqWriterUsesStoreHealthReasonForPausedStore() throws Exception {
         KinexisStoreControl storeControl = new KinexisStoreControl(new KinexisProperties());
         inject(processor, "storeControl", storeControl);
@@ -1370,12 +1459,45 @@ class RedisStreamsIntegrationTest {
                 .withStreamKey(Misc.getStreamKey(TestEntity.class));
     }
 
+    private MapRecord<String, String, String> oldSchemaRecord(long entityId,
+                                                              String content,
+                                                              String schemaVersion,
+                                                              String... targets) {
+        Map<String, String> record = new java.util.HashMap<>(KinexisEvent.save(
+                TestEntity.class,
+                entityId,
+                content,
+                targets).toRecordMap());
+        record.put(KinexisEvent.EVENT_SCHEMA_VERSION_KEY, schemaVersion);
+        return StreamRecords.newRecord()
+                .withId(RecordId.autoGenerate())
+                .ofMap(record)
+                .withStreamKey(Misc.getStreamKey(TestEntity.class));
+    }
+
+    private KinexisEventSchemaRegistry eventSchemaRegistry(String currentVersion, KinexisEventUpcaster... upcasters) {
+        return new DefaultKinexisEventSchemaRegistry(
+                true,
+                currentVersion,
+                Map.of(TestEntity.class.getName(), currentVersion),
+                List.of(upcasters));
+    }
+
     private String addDlqRecord(long entityId, String name, String failedStore) throws Exception {
+        return addDlqRecord(
+                entityId,
+                objectMapper.writeValueAsString(new TestEntity(entityId, name)),
+                failedStore,
+                KinexisEvent.CURRENT_SCHEMA_VERSION);
+    }
+
+    private String addDlqRecord(long entityId, String content, String failedStore, String schemaVersion) {
         Map<String, String> dlqRecord = new java.util.HashMap<>(KinexisEvent.save(
                 TestEntity.class,
                 entityId,
-                objectMapper.writeValueAsString(new TestEntity(entityId, name)),
+                content,
                 failedStore).toRecordMap());
+        dlqRecord.put(KinexisEvent.EVENT_SCHEMA_VERSION_KEY, schemaVersion);
         dlqRecord.put(AbstractPendingMessageHandler.DLQ_REASON_KEY, "manual");
         dlqRecord.put(AbstractPendingMessageHandler.DLQ_STREAM_KEY, Misc.getStreamKey(TestEntity.class));
         dlqRecord.put(AbstractPendingMessageHandler.DLQ_STREAM_ID_KEY, entityId + "-0");
@@ -1711,6 +1833,23 @@ class RedisStreamsIntegrationTest {
             appendCount++;
             lastEvent = event;
             return "test-record";
+        }
+    }
+
+    private static final class LegacyNameUpcaster implements KinexisEventUpcaster {
+
+        @Override
+        public boolean supports(String entityType, String fromVersion, String toVersion) {
+            return TestEntity.class.getName().equals(entityType)
+                    && "1".equals(fromVersion)
+                    && "2".equals(toVersion);
+        }
+
+        @Override
+        public KinexisEventEnvelope upcast(KinexisEventEnvelope envelope, String toVersion) {
+            return envelope
+                    .withContent(envelope.content().replace("\"legacyName\"", "\"name\""))
+                    .withSchemaVersion("2");
         }
     }
 

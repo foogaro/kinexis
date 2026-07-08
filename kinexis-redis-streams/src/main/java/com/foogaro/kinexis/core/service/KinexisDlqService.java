@@ -2,6 +2,7 @@ package com.foogaro.kinexis.core.service;
 
 import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisEvent;
+import com.foogaro.kinexis.core.model.KinexisEventEnvelope;
 import com.foogaro.kinexis.core.model.KinexisReplayOptions;
 import com.foogaro.kinexis.core.model.KinexisReplayResult;
 import com.foogaro.kinexis.core.model.KinexisReplayStatus;
@@ -53,6 +54,7 @@ public class KinexisDlqService {
     private final RedisTemplate<String, String> redisTemplate;
     private final KinexisTelemetry telemetry;
     private final KinexisStoreControl storeControl;
+    private final KinexisEventSchemaRegistry eventSchemaRegistry;
 
     public KinexisDlqService(RedisTemplate<String, String> redisTemplate) {
         this(redisTemplate, new SimpleKinexisTelemetry());
@@ -65,9 +67,17 @@ public class KinexisDlqService {
     public KinexisDlqService(RedisTemplate<String, String> redisTemplate,
                              KinexisTelemetry telemetry,
                              KinexisStoreControl storeControl) {
+        this(redisTemplate, telemetry, storeControl, KinexisEventSchemaRegistry.noop());
+    }
+
+    public KinexisDlqService(RedisTemplate<String, String> redisTemplate,
+                             KinexisTelemetry telemetry,
+                             KinexisStoreControl storeControl,
+                             KinexisEventSchemaRegistry eventSchemaRegistry) {
         this.redisTemplate = redisTemplate;
         this.telemetry = telemetry;
         this.storeControl = storeControl;
+        this.eventSchemaRegistry = eventSchemaRegistry;
     }
 
     public Optional<String> replay(Class<?> entityType, String dlqRecordId) {
@@ -287,6 +297,7 @@ public class KinexisDlqService {
                                 ReplayMode replayMode, boolean newEventId, String... targets) {
         Map<String, String> replayMessage = toReplayMessage(record);
         validateReplayMessage(replayMessage);
+        replayMessage = upcastReplayMessage(entityType, record, replayMessage);
         if (newEventId) {
             replayMessage.put(EVENT_ID_KEY, newEventId());
         }
@@ -310,6 +321,24 @@ public class KinexisDlqService {
         }
         telemetry.increment(KinexisTelemetry.DLQ_REPLAYS, replayTags(entityType, targetStream, record, replayMode, newEventId, replayMessage.get(EVENT_TARGETS_KEY)));
         return replayedId.getValue();
+    }
+
+    private Map<String, String> upcastReplayMessage(Class<?> entityType,
+                                                    MapRecord<String, Object, Object> record,
+                                                    Map<String, String> replayMessage) {
+        KinexisEventEnvelope envelope = eventSchemaRegistry.upcast(KinexisEventEnvelope.from(
+                replayMessage,
+                record.getId().getValue(),
+                entityType));
+        String originalVersion = replayMessage.getOrDefault(KinexisEvent.EVENT_SCHEMA_VERSION_KEY, KinexisEvent.CURRENT_SCHEMA_VERSION);
+        if (!originalVersion.equals(envelope.schemaVersion())) {
+            telemetry.increment(KinexisTelemetry.STREAM_EVENTS_UPCASTED, Map.of(
+                    "entity", entityType.getSimpleName(),
+                    "stream", Optional.ofNullable(value(record, DLQ_STREAM_KEY)).orElse(getStreamKey(entityType)),
+                    "fromVersion", originalVersion,
+                    "toVersion", envelope.schemaVersion()));
+        }
+        return envelope.toRecordMap();
     }
 
     private void recordReplayFailure(Class<?> entityType,
