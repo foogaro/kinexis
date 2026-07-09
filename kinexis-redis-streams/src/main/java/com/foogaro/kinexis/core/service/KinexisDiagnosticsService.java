@@ -106,7 +106,7 @@ public class KinexisDiagnosticsService {
                 store.entityType().getName(),
                 store.targets(),
                 store instanceof CacheStore<?>,
-                storeControl == null ? null : storeControl.status(store.entityType(), store.name()));
+                storeControl == null ? null : storeControl.checkStatus(store.entityType(), store.name()));
     }
 
     public record EntityDiagnostics(Class<?> entityType,

@@ -21,10 +21,11 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Abstract base class for Kinexis services that handle entity operations with Redis caching.
+ * Abstract base class for Kinexis services that handle entity operations through Kinexis store abstractions.
  * This class provides core functionality for CRUD operations with support for various caching patterns
- * including Write-Behind, Cache-Aside, and Refresh-Ahead. It manages both Redis cache and database
- * operations through appropriate repositories.
+ * including Write-Behind, Cache-Aside, and Refresh-Ahead. It resolves cache and backing-store operations
+ * through {@link EntityStoreRegistry}, {@link CacheStore}, and {@link com.foogaro.kinexis.core.store.EntityStore}
+ * instead of depending on database-specific repositories directly.
  *
  * @param <T> the type of entity that this service handles
  */

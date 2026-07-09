@@ -23,6 +23,7 @@ import com.foogaro.kinexis.core.store.DefaultEntityStoreRegistry;
 import com.foogaro.kinexis.core.store.EmptyEntityStoreRegistry;
 import com.foogaro.kinexis.core.store.EntityStore;
 import com.foogaro.kinexis.core.store.EntityStoreRegistry;
+import com.foogaro.kinexis.core.store.StoreHealthCheck;
 import com.foogaro.kinexis.core.stream.EventPublisher;
 import com.foogaro.kinexis.core.stream.KinexisStreamLifecycle;
 import com.foogaro.kinexis.core.stream.RedisStreamEventPublisher;
@@ -55,8 +56,6 @@ import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
-import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
-import org.springframework.data.redis.serializer.GenericToStringSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.data.redis.stream.StreamMessageListenerContainer;
 
@@ -145,8 +144,8 @@ public class KinexisConfiguration {
         logger.debug("Creating RedisTemplate");
         RedisTemplate<String, String> template = new RedisTemplate<>();
         template.setConnectionFactory(connectionFactory);
-        template.setKeySerializer(new GenericToStringSerializer<>(String.class));
-        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new StringRedisSerializer());
         template.setHashKeySerializer(new StringRedisSerializer());
         template.setHashValueSerializer(new StringRedisSerializer());
         logger.debug("Created RedisTemplate: {}", template);
@@ -241,8 +240,15 @@ public class KinexisConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public KinexisStoreControl kinexisStoreControl(KinexisProperties properties, KinexisTelemetry telemetry) {
-        return new KinexisStoreControl(properties, telemetry);
+    public KinexisStoreControl kinexisStoreControl(KinexisProperties properties,
+                                                   KinexisTelemetry telemetry,
+                                                   ObjectProvider<EntityStore<?>> entityStores,
+                                                   ObjectProvider<StoreHealthCheck> storeHealthChecks) {
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        storeControl.registerHealthChecks(
+                entityStores.orderedStream().toList(),
+                storeHealthChecks.orderedStream().toList());
+        return storeControl;
     }
 
     @Bean
@@ -270,8 +276,9 @@ public class KinexisConfiguration {
     public KinexisDlqService kinexisDlqService(@Qualifier("redisTemplate") RedisTemplate<String, String> redisTemplate,
                                                KinexisTelemetry telemetry,
                                                KinexisStoreControl storeControl,
-                                               KinexisEventSchemaRegistry eventSchemaRegistry) {
-        return new KinexisDlqService(redisTemplate, telemetry, storeControl, eventSchemaRegistry);
+                                               KinexisEventSchemaRegistry eventSchemaRegistry,
+                                               KinexisProcessingCoordinator processingCoordinator) {
+        return new KinexisDlqService(redisTemplate, telemetry, storeControl, eventSchemaRegistry, processingCoordinator);
     }
 
     @Bean

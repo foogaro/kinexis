@@ -27,7 +27,7 @@ Prefer the BOM when using split modules:
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.4.0</version>
+            <version>2.5.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -60,7 +60,7 @@ If you prefer the compatibility bundle:
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.4.0</version>
+    <version>2.5.0</version>
 </dependency>
 ```
 
@@ -434,6 +434,27 @@ kinexisStoreControl.status(Employer.class, "mysql");
 
 Kinexis also opens a store circuit automatically after repeated failures. While a store is paused or its circuit is open, calls to that store are skipped and the normal pending retry and per-store DLQ flow applies. Store-targeted DLQ replay skips paused and open-circuit stores by default; use `KinexisReplayOptions.forced()` only when an operator explicitly wants to override the guardrail.
 
+Add `StoreHealthCheck` when a store can be probed before the next write:
+
+```java
+import com.foogaro.kinexis.core.model.StoreHealthCheckResult;
+import com.foogaro.kinexis.core.store.EntityStore;
+import com.foogaro.kinexis.core.store.StoreHealthCheck;
+
+final class MysqlEmployerStore
+        implements EntityStore<Employer>, StoreHealthCheck {
+
+    @Override
+    public StoreHealthCheckResult check() {
+        return repository.ping()
+                ? StoreHealthCheckResult.up("ready")
+                : StoreHealthCheckResult.unhealthy("mysql unavailable");
+    }
+}
+```
+
+If the check is a separate bean instead of part of the store, implement `checkedEntityType()` and `checkedStoreName()` so Kinexis can bind it to the right store. Spring auto-registers both patterns. Operators can call `kinexisStoreControl.checkStatus(Employer.class, "mysql")` or `kinexisStoreControl.checkAll()`; diagnostics use active checks when one is available and still preserve manual `PAUSED` state.
+
 ## DLQ Operations
 
 Inject `KinexisDlqService` for operational replay:
@@ -441,15 +462,21 @@ Inject `KinexisDlqService` for operational replay:
 ```java
 import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisReplayOptions;
+import com.foogaro.kinexis.core.model.KinexisReplayPlan;
 import com.foogaro.kinexis.core.model.KinexisReplayResult;
+import com.foogaro.kinexis.core.model.ReplayBatchOptions;
 import com.foogaro.kinexis.core.service.KinexisDlqService;
 
+import java.time.Duration;
 import java.util.List;
 
 List<KinexisDlqRecord> all = kinexisDlqService.list(Employer.class);
 
 List<KinexisDlqRecord> mysqlFailures =
         kinexisDlqService.listByFailedStore(Employer.class, "mysql");
+
+KinexisReplayPlan mysqlPlan =
+        kinexisDlqService.previewReplayByStore(Employer.class, "mysql");
 
 kinexisDlqService.replayFailedStore(Employer.class, dlqRecordId);
 kinexisDlqService.replayByStore(Employer.class, "postgresql");
@@ -461,6 +488,20 @@ KinexisReplayResult result =
 List<KinexisReplayResult> postgresResults =
         kinexisDlqService.replayByStoreIfHealthy(Employer.class, "postgresql");
 
+List<KinexisReplayResult> boundedMysqlReplay =
+        kinexisDlqService.replayByStore(
+                Employer.class,
+                "mysql",
+                new ReplayBatchOptions(
+                        100,
+                        Duration.ofMinutes(30),
+                        true,
+                        true,
+                        Duration.ofMillis(25),
+                        KinexisReplayOptions.safe()
+                )
+        );
+
 KinexisReplayResult forced =
         kinexisDlqService.replayFailedStoreResult(
                 Employer.class,
@@ -469,6 +510,10 @@ KinexisReplayResult forced =
                 KinexisReplayOptions.forced()
         );
 ```
+
+`KinexisReplayPlan` is a dry run. It reports records found, target stores, stores already processed by idempotency, unhealthy stores, records that would be skipped, records that would be replayed, and records requiring schema upcast. It does not append anything to Redis.
+
+Use `ReplayBatchOptions` for large DLQ recovery. It caps replay volume, filters records by age, can delete successfully replayed DLQ records, can stop after the first non-replayed result, and can add a delay between records to reduce store pressure.
 
 Use `replayWithNewEventId(...)` only when you explicitly want the replay to be treated as new work by all matching stores.
 
@@ -485,6 +530,9 @@ Useful metrics include:
 | `kinexis.stream.events.upcasted` | Old stream or DLQ records migrated to the current schema version. |
 | `kinexis.store.write.latency` | Store save/delete latency by store and operation. |
 | `kinexis.store.failures` | Store failures by exception class. |
+| `kinexis.store.health.state` | Current store health state gauge. |
+| `kinexis.store.probe.failures` | Failed write probes or active health checks. |
+| `kinexis.store.probe.successes` | Successful recovery probes or active health checks. |
 | `kinexis.pending.retries` | Pending retry pressure. |
 | `kinexis.dlq.records` | DLQ records by failed store. |
 | `kinexis.dlq.replays` | Replay activity by failed store and event ID mode. |

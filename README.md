@@ -39,7 +39,7 @@ Existing imports remain stable. Even when using the split modules, public classe
 | Pending retry | Reprocesses pending Redis Stream records using configurable retry limits. |
 | Per-store DLQ and replay | Moves exhausted failures to a dead-letter stream per failed store, lists records through a typed DTO, and replays all records, one store, or one failed-store record. |
 | Backpressure | Bounds in-flight records and executor queue depth, with block, slow-down, or reject-to-DLQ behavior. |
-| Store health controls | Lets operators pause/resume stores and automatically opens per-store circuits after repeated failures. |
+| Store health controls | Lets operators pause/resume stores, run optional active health checks, and automatically opens per-store circuits after repeated failures. |
 | Telemetry | Exposes dependency-light counters/timers and optionally forwards to Micrometer when a `MeterRegistry` bean exists. |
 | Validation and diagnostics | Validates store wiring at startup and exposes runtime metadata through service APIs. |
 
@@ -57,7 +57,7 @@ Use `kinexis-bom` to align split module versions from one place.
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.4.0</version>
+            <version>2.5.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -86,7 +86,7 @@ Use `kinexis-core` when you want the same one-dependency setup as earlier releas
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-core</artifactId>
-    <version>2.4.0</version>
+    <version>2.5.0</version>
 </dependency>
 ```
 
@@ -100,7 +100,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.4.0</version>
+    <version>2.5.0</version>
 </dependency>
 ```
 
@@ -114,12 +114,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.4.0</version>
+    <version>2.5.0</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.4.0</version>
+    <version>2.5.0</version>
 </dependency>
 ```
 
@@ -131,7 +131,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.4.0</version>
+    <version>2.5.0</version>
 </dependency>
 ```
 
@@ -144,7 +144,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.4.0</version>
+        <version>2.5.0</version>
     </path>
 </annotationProcessorPaths>
 ```
@@ -606,6 +606,68 @@ Automatic circuit opening is local to the running application instance and depen
 
 Skipped store calls are not marked idempotently processed. They remain eligible for normal pending retry and per-store DLQ. DLQ replay methods that target a failed store skip `PAUSED` and `OPEN_CIRCUIT` stores by default; use `KinexisReplayOptions.forced()` only for an intentional operator override.
 
+Stores can also provide active health checks. This lets Kinexis discover an unavailable store before the next write reaches the backing database, and diagnostics can report the last active check result separately from manual `PAUSED` state.
+
+```java
+import com.foogaro.kinexis.core.model.StoreHealthCheckResult;
+import com.foogaro.kinexis.core.store.EntityStore;
+import com.foogaro.kinexis.core.store.StoreHealthCheck;
+
+import java.util.Optional;
+
+@Bean
+EntityStore<Employer> mysqlEmployerStore(MySqlEmployerRepository repository) {
+    return new MysqlEmployerStore(repository);
+}
+
+final class MysqlEmployerStore
+        implements EntityStore<Employer>, StoreHealthCheck {
+
+    private final MySqlEmployerRepository repository;
+
+    MysqlEmployerStore(MySqlEmployerRepository repository) {
+        this.repository = repository;
+    }
+
+    @Override
+    public StoreHealthCheckResult check() {
+        return repository.ping()
+                ? StoreHealthCheckResult.up("ready")
+                : StoreHealthCheckResult.unhealthy("ping failed");
+    }
+
+    // EntityStore methods omitted
+}
+```
+
+Standalone `StoreHealthCheck` beans are also supported. Because they are not themselves stores, they expose the checked entity/store metadata through `checkedEntityType()` and `checkedStoreName()`:
+
+```java
+@Bean
+StoreHealthCheck mysqlEmployerHealthCheck(MySqlHealthClient client) {
+    return new StoreHealthCheck() {
+        @Override
+        public StoreHealthCheckResult check() {
+            return client.available()
+                    ? StoreHealthCheckResult.up()
+                    : StoreHealthCheckResult.unhealthy("connection refused");
+        }
+
+        @Override
+        public Optional<Class<?>> checkedEntityType() {
+            return Optional.of(Employer.class);
+        }
+
+        @Override
+        public Optional<String> checkedStoreName() {
+            return Optional.of("mysql");
+        }
+    };
+}
+```
+
+Spring auto-registers `EntityStore` beans that implement `StoreHealthCheck` and standalone `StoreHealthCheck` beans. You can also call `kinexisStoreControl.registerHealthCheck(...)` manually. Use `check(entity, store)`, `checkStatus(entity, store)`, or `checkAll()` for operator jobs. `status(...)` returns the current passive state without executing a check.
+
 ```properties
 kinexis.store-health.enabled=true
 kinexis.store-health.failure-threshold=10
@@ -755,7 +817,7 @@ public class KinexisAdminService {
 }
 ```
 
-Diagnostics include entity class, enabled flag, patterns, TTL, cache store, primary store, target stores, all known stores for duplicate or ambiguity checks, and each store's current health status when `KinexisStoreControl` is available.
+Diagnostics include entity class, enabled flag, patterns, TTL, cache store, primary store, target stores, all known stores for duplicate or ambiguity checks, and each store's health status when `KinexisStoreControl` is available. Diagnostics call `checkStatus(...)`, so registered active health checks may run during diagnostics inspection; use `status(...)` directly when you need a passive health-state read.
 
 ## Dead-Letter Queue And Replay
 
@@ -835,6 +897,35 @@ Optional<String> replayedId = kinexisDlqService.replayFailedStore(
 );
 ```
 
+Preview replay impact before appending anything back to Redis Streams:
+
+```java
+import com.foogaro.kinexis.core.model.KinexisReplayPlan;
+
+KinexisReplayPlan plan =
+        kinexisDlqService.previewReplayByStore(Employer.class, "mysql");
+
+int found = plan.recordsFound();
+int skipped = plan.recordsSkipped();
+int replayed = plan.recordsReplayed();
+int needsUpcast = plan.recordsRequiringSchemaUpcast();
+
+List<String> targets = plan.targetStores();
+List<String> alreadyProcessed = plan.storesAlreadyProcessed();
+List<String> unhealthy = plan.storesUnhealthy();
+```
+
+`KinexisReplayPlan` is a dry run. It does not append, delete, acknowledge, or mutate any Redis data. It reports the DLQ records found, target stores, stores already protected by idempotency, unhealthy stores, records that would be skipped, records that would be replayed, and records that require schema upcasting. Use the forced preview variant to see how `KinexisReplayOptions.forced()` would change the plan for paused or open-circuit stores:
+
+```java
+KinexisReplayPlan forcedPlan =
+        kinexisDlqService.previewReplayByStore(
+                Employer.class,
+                "mysql",
+                KinexisReplayOptions.forced()
+        );
+```
+
 For operator workflows, prefer the typed result API. It reports whether the record was replayed, missing, failed, or skipped because the failed store is currently paused or has an open circuit:
 
 ```java
@@ -861,6 +952,28 @@ List<String> replayedIds = kinexisDlqService.replayByStore(
         "mysql"
 );
 ```
+
+Replay a bounded batch for a failed store when the DLQ is large:
+
+```java
+import com.foogaro.kinexis.core.model.ReplayBatchOptions;
+
+List<KinexisReplayResult> mysqlBatch =
+        kinexisDlqService.replayByStore(
+                Employer.class,
+                "mysql",
+                new ReplayBatchOptions(
+                        100,                    // limit
+                        Duration.ofMinutes(30), // only records older than this age
+                        true,                   // deleteAfterReplay
+                        true,                   // stopOnFirstFailure
+                        Duration.ofMillis(25),  // delayBetweenRecords
+                        KinexisReplayOptions.safe()
+                )
+        );
+```
+
+`ReplayBatchOptions` gives operators bounded recovery controls for large DLQs. `limit` caps the number of records selected; values less than or equal to zero are treated as unbounded. `olderThan` prevents replaying fresh failures too quickly, `deleteAfterReplay` removes successfully appended DLQ records, `stopOnFirstFailure` halts the batch after the first non-replayed result, `delayBetweenRecords` slows pressure on backing stores, and `replayOptions` chooses safe or forced replay behavior for paused/open-circuit stores.
 
 The result-returning variants include skipped records instead of silently dropping them:
 
@@ -972,7 +1085,7 @@ Run a demo module:
 ./mvnw -pl demo/kinexis-demo-psql -am test
 ```
 
-The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, store health controls, circuit breaking, partitioning, idempotency, event schema evolution, telemetry, and generated-code compatibility.
+The test suite uses Testcontainers and covers Redis Streams append, save, delete, failed processing, pending retry, DLQ, replay, TTL, explicit stores, repository discovery opt-in, diagnostics, validation, target routing, parallel fan-out, backpressure, store health controls, active health checks, circuit breaking, partitioning, idempotency, event schema evolution, telemetry, and generated-code compatibility.
 
 ## Demo Projects
 

@@ -124,6 +124,12 @@ graph TD
 
 ```mermaid
 graph TD
+    ActiveCheck["StoreHealthCheck.check"] --> CheckResult{"healthy?"}
+    CheckResult -- "yes" --> CheckSuccess["Record probe success"]
+    CheckResult -- "no/exception" --> CheckFailure["Record active health failure"]
+    CheckFailure --> Count
+    CheckSuccess --> Close
+
     Failure["Store call failure"] --> Count["Record failure in rolling window"]
     Count --> Threshold{"Failures >= threshold?"}
     Threshold -- "no" --> Degraded["State DEGRADED"]
@@ -143,9 +149,12 @@ graph TD
 
     Operator["Operator"] --> Pause["pause(entity, store)"]
     Pause --> Paused["State PAUSED"]
-    Paused --> Skipped["Skip store calls into retry/DLQ path"]
+    Paused --> Skipped["Skip store calls and active checks into retry/DLQ path"]
     Operator --> Resume["resume(entity, store)"]
     Resume --> Active
+
+    Diagnostics["Diagnostics / checkStatus / checkAll"] --> ActiveCheck
+    Processor["Processor before store call"] --> ActiveCheck
 ```
 
 ## Pending Retry And Per-Store DLQ Flow
@@ -191,15 +200,21 @@ graph TD
     Query -- "listByFailedStore(entity, store)" --> ListStore["Filter by failedStore"]
     Query -- "listByOperation(entity, operation)" --> ListOperation["Filter by operation"]
     Query -- "listOlderThan(entity, age)" --> ListAge["Filter by failureTimestamp"]
+    Query -- "previewReplayByStore(entity, mysql)" --> Preview["Build KinexisReplayPlan"]
 
     Query -- "replayFailedStore(entity, recordId)" --> ReplayFailed["Read DLQ record - use failedStore as target"]
     Query -- "replayByStore(entity, mysql)" --> ReplayStore["Replay all DLQ records where failedStore=mysql"]
+    Query -- "replayByStore(entity, mysql, batchOptions)" --> ReplayBatch["Bound by limit, age, delay, delete mode"]
     Query -- "replayAllFailedStores(entity)" --> ReplayAll["Replay every store-specific DLQ record"]
     Query -- "replayByStoreIfHealthy(...)" --> ReplayHealthy["Return KinexisReplayResult for replayed or skipped records"]
     Query -- "replayWithNewEventId(...)" --> NewEvent["Generate new eventId"]
 
+    Preview --> PreviewChecks["Check idempotency, store health, schema upcast"]
+    PreviewChecks --> PreviewResult["Return dry-run counts and per-record decisions"]
+
     ReplayFailed --> HealthCheck{"failedStore healthy or force option?"}
     ReplayStore --> HealthCheck
+    ReplayBatch --> HealthCheck
     ReplayAll --> HealthCheck
     ReplayHealthy --> HealthCheck
 

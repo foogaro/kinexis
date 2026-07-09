@@ -4,6 +4,9 @@ import com.foogaro.kinexis.core.config.KinexisProperties;
 import com.foogaro.kinexis.core.exception.KinexisStoreUnavailableException;
 import com.foogaro.kinexis.core.model.KinexisStoreHealthState;
 import com.foogaro.kinexis.core.model.KinexisStoreHealthStatus;
+import com.foogaro.kinexis.core.model.StoreHealthCheckResult;
+import com.foogaro.kinexis.core.store.EntityStore;
+import com.foogaro.kinexis.core.store.StoreHealthCheck;
 import com.foogaro.kinexis.core.telemetry.KinexisTelemetry;
 import com.foogaro.kinexis.core.telemetry.SimpleKinexisTelemetry;
 
@@ -11,10 +14,12 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -24,6 +29,7 @@ public class KinexisStoreControl {
     private final KinexisTelemetry telemetry;
     private final Clock clock;
     private final ConcurrentMap<StoreKey, StoreState> states = new ConcurrentHashMap<>();
+    private final ConcurrentMap<StoreKey, StoreHealthCheck> healthChecks = new ConcurrentHashMap<>();
 
     public KinexisStoreControl(KinexisProperties properties) {
         this(properties, new SimpleKinexisTelemetry());
@@ -65,17 +71,103 @@ public class KinexisStoreControl {
         }
     }
 
+    public void registerHealthChecks(Collection<? extends EntityStore<?>> stores,
+                                     Collection<? extends StoreHealthCheck> checks) {
+        if (stores != null) {
+            stores.stream()
+                    .filter(StoreHealthCheck.class::isInstance)
+                    .forEach(store -> registerHealthCheck(
+                            store.entityType(),
+                            store.name(),
+                            (StoreHealthCheck) store));
+        }
+        if (checks != null) {
+            checks.forEach(this::registerHealthCheck);
+        }
+    }
+
+    public void registerHealthCheck(StoreHealthCheck healthCheck) {
+        Objects.requireNonNull(healthCheck, "healthCheck cannot be null");
+        if (healthCheck instanceof EntityStore<?> store) {
+            registerHealthCheck(store.entityType(), store.name(), healthCheck);
+            return;
+        }
+        Optional<Class<?>> entityType = healthCheck.checkedEntityType();
+        Optional<String> storeName = healthCheck.checkedStoreName();
+        if (entityType.isEmpty() || storeName.isEmpty()) {
+            throw new IllegalArgumentException("Standalone StoreHealthCheck beans must expose entityType and storeName");
+        }
+        registerHealthCheck(entityType.get(), storeName.get(), healthCheck);
+    }
+
+    public void registerHealthCheck(Class<?> entityType, String storeName, StoreHealthCheck healthCheck) {
+        healthChecks.put(key(entityType, storeName), Objects.requireNonNull(healthCheck, "healthCheck cannot be null"));
+    }
+
     public KinexisStoreHealthStatus status(Class<?> entityType, String storeName) {
         StoreKey key = key(entityType, storeName);
         StoreState state = states.get(key);
         if (state == null) {
             return new KinexisStoreHealthStatus(entityType.getSimpleName(), storeName,
-                    KinexisStoreHealthState.ACTIVE, 0, 0, null, null);
+                    KinexisStoreHealthState.ACTIVE, 0, 0, null, null, null, null);
         }
         synchronized (state) {
             refreshOpenCircuit(key, state, now());
             return status(key, state);
         }
+    }
+
+    public KinexisStoreHealthStatus checkStatus(Class<?> entityType, String storeName) {
+        check(entityType, storeName);
+        return status(entityType, storeName);
+    }
+
+    public Optional<StoreHealthCheckResult> check(Class<?> entityType, String storeName) {
+        if (!properties.getStoreHealth().isEnabled()) {
+            return Optional.empty();
+        }
+        StoreKey key = key(entityType, storeName);
+        StoreHealthCheck healthCheck = healthChecks.get(key);
+        if (healthCheck == null) {
+            return Optional.empty();
+        }
+        StoreState state = states.computeIfAbsent(key, ignored -> new StoreState());
+        synchronized (state) {
+            refreshOpenCircuit(key, state, now());
+            if (state.state == KinexisStoreHealthState.PAUSED) {
+                return Optional.of(StoreHealthCheckResult.skipped("Store paused"));
+            }
+            if (state.state == KinexisStoreHealthState.OPEN_CIRCUIT) {
+                return Optional.of(StoreHealthCheckResult.skipped("Circuit is open"));
+            }
+        }
+
+        StoreHealthCheckResult result;
+        try {
+            result = Optional.ofNullable(healthCheck.check())
+                    .orElseGet(() -> StoreHealthCheckResult.unhealthy("Health check returned null"));
+        } catch (RuntimeException e) {
+            result = StoreHealthCheckResult.failed(e);
+        }
+
+        if (result.skipped()) {
+            return Optional.of(result);
+        }
+
+        synchronized (state) {
+            refreshOpenCircuit(key, state, now());
+            if (state.state == KinexisStoreHealthState.PAUSED) {
+                return Optional.of(StoreHealthCheckResult.skipped("Store paused"));
+            }
+            state.lastHealthCheckAt = now();
+            state.lastHealthCheckResult = result;
+            if (result.healthy()) {
+                recordHealthCheckSuccess(key, state);
+            } else {
+                recordHealthCheckFailure(key, state);
+            }
+        }
+        return Optional.of(result);
     }
 
     public List<KinexisStoreHealthStatus> status(Class<?> entityType) {
@@ -105,10 +197,18 @@ public class KinexisStoreControl {
                 .toList();
     }
 
+    public List<KinexisStoreHealthStatus> checkAll() {
+        return healthChecks.keySet().stream()
+                .sorted(Comparator.comparing(StoreKey::entitySimpleName).thenComparing(StoreKey::storeName))
+                .map(key -> checkStatus(entityType(key), key.storeName()))
+                .toList();
+    }
+
     public void beforeCall(Class<?> entityType, String storeName) {
         if (!properties.getStoreHealth().isEnabled()) {
             return;
         }
+        check(entityType, storeName);
         StoreKey key = key(entityType, storeName);
         StoreState state = states.computeIfAbsent(key, ignored -> new StoreState());
         synchronized (state) {
@@ -173,6 +273,50 @@ public class KinexisStoreControl {
                 } else if (state.state == KinexisStoreHealthState.ACTIVE) {
                     transition(key, state, KinexisStoreHealthState.DEGRADED);
                 }
+            }
+        }
+    }
+
+    private void recordHealthCheckSuccess(StoreKey key, StoreState state) {
+        telemetry.increment(KinexisTelemetry.STORE_PROBE_SUCCESSES, tags(key));
+        if (state.state == KinexisStoreHealthState.RECOVERING || state.state == KinexisStoreHealthState.DEGRADED) {
+            boolean recovering = state.state == KinexisStoreHealthState.RECOVERING;
+            state.probeSuccesses++;
+            if (state.probeSuccesses >= probeSuccessThreshold()) {
+                Instant lastHealthCheckAt = state.lastHealthCheckAt;
+                StoreHealthCheckResult lastHealthCheckResult = state.lastHealthCheckResult;
+                state.reset();
+                state.lastHealthCheckAt = lastHealthCheckAt;
+                state.lastHealthCheckResult = lastHealthCheckResult;
+                transition(key, state, KinexisStoreHealthState.ACTIVE);
+                if (recovering) {
+                    telemetry.increment(KinexisTelemetry.STORE_CIRCUIT_CLOSED, tags(key));
+                }
+            }
+            return;
+        }
+        if (state.state == KinexisStoreHealthState.ACTIVE) {
+            pruneFailures(state, now());
+        }
+    }
+
+    private void recordHealthCheckFailure(StoreKey key, StoreState state) {
+        telemetry.increment(KinexisTelemetry.STORE_PROBE_FAILURES, tags(key));
+        Instant now = now();
+        refreshOpenCircuit(key, state, now);
+        state.lastFailureAt = now;
+        state.probeSuccesses = 0;
+        state.failures.addLast(now);
+        pruneFailures(state, now);
+        if (state.state == KinexisStoreHealthState.RECOVERING) {
+            openCircuit(key, state, now);
+            return;
+        }
+        if (state.state == KinexisStoreHealthState.ACTIVE || state.state == KinexisStoreHealthState.DEGRADED) {
+            if (state.failures.size() >= failureThreshold()) {
+                openCircuit(key, state, now);
+            } else if (state.state == KinexisStoreHealthState.ACTIVE) {
+                transition(key, state, KinexisStoreHealthState.DEGRADED);
             }
         }
     }
@@ -245,7 +389,9 @@ public class KinexisStoreControl {
                 state.failures.size(),
                 state.probeSuccesses,
                 state.openedUntil,
-                state.lastFailureAt);
+                state.lastFailureAt,
+                state.lastHealthCheckAt,
+                state.lastHealthCheckResult);
     }
 
     private StoreKey key(Class<?> entityType, String storeName) {
@@ -254,6 +400,14 @@ public class KinexisStoreControl {
             throw new IllegalArgumentException("storeName cannot be blank");
         }
         return new StoreKey(entityType.getName(), entityType.getSimpleName(), storeName);
+    }
+
+    private Class<?> entityType(StoreKey key) {
+        try {
+            return Class.forName(key.entityType());
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("Cannot resolve entity type " + key.entityType(), e);
+        }
     }
 
     private Instant now() {
@@ -286,12 +440,16 @@ public class KinexisStoreControl {
         private int probeSuccesses;
         private Instant openedUntil;
         private Instant lastFailureAt;
+        private Instant lastHealthCheckAt;
+        private StoreHealthCheckResult lastHealthCheckResult;
 
         private void reset() {
             failures.clear();
             probeSuccesses = 0;
             openedUntil = null;
             lastFailureAt = null;
+            lastHealthCheckAt = null;
+            lastHealthCheckResult = null;
         }
     }
 }

@@ -4,9 +4,12 @@ import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisEvent;
 import com.foogaro.kinexis.core.model.KinexisEventEnvelope;
 import com.foogaro.kinexis.core.model.KinexisReplayOptions;
+import com.foogaro.kinexis.core.model.KinexisReplayPlan;
 import com.foogaro.kinexis.core.model.KinexisReplayResult;
 import com.foogaro.kinexis.core.model.KinexisReplayStatus;
 import com.foogaro.kinexis.core.model.KinexisStoreHealthStatus;
+import com.foogaro.kinexis.core.model.ReplayBatchOptions;
+import com.foogaro.kinexis.core.processor.KinexisProcessingCoordinator;
 import com.foogaro.kinexis.core.telemetry.KinexisTelemetry;
 import com.foogaro.kinexis.core.telemetry.SimpleKinexisTelemetry;
 import com.foogaro.kinexis.core.config.KinexisProperties;
@@ -18,10 +21,13 @@ import org.springframework.data.redis.core.RedisTemplate;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Predicate;
 
 import static com.foogaro.kinexis.core.Misc.EVENT_CONTENT_KEY;
@@ -55,6 +61,7 @@ public class KinexisDlqService {
     private final KinexisTelemetry telemetry;
     private final KinexisStoreControl storeControl;
     private final KinexisEventSchemaRegistry eventSchemaRegistry;
+    private final KinexisProcessingCoordinator processingCoordinator;
 
     public KinexisDlqService(RedisTemplate<String, String> redisTemplate) {
         this(redisTemplate, new SimpleKinexisTelemetry());
@@ -74,10 +81,19 @@ public class KinexisDlqService {
                              KinexisTelemetry telemetry,
                              KinexisStoreControl storeControl,
                              KinexisEventSchemaRegistry eventSchemaRegistry) {
+        this(redisTemplate, telemetry, storeControl, eventSchemaRegistry, null);
+    }
+
+    public KinexisDlqService(RedisTemplate<String, String> redisTemplate,
+                             KinexisTelemetry telemetry,
+                             KinexisStoreControl storeControl,
+                             KinexisEventSchemaRegistry eventSchemaRegistry,
+                             KinexisProcessingCoordinator processingCoordinator) {
         this.redisTemplate = redisTemplate;
         this.telemetry = telemetry;
         this.storeControl = storeControl;
         this.eventSchemaRegistry = eventSchemaRegistry;
+        this.processingCoordinator = processingCoordinator;
     }
 
     public Optional<String> replay(Class<?> entityType, String dlqRecordId) {
@@ -219,6 +235,48 @@ public class KinexisDlqService {
                 .toList();
     }
 
+    public List<KinexisReplayResult> replayByStore(Class<?> entityType,
+                                                   String failedStore,
+                                                   ReplayBatchOptions options) {
+        ReplayBatchOptions batchOptions = options == null ? ReplayBatchOptions.defaults() : options;
+        ReplayMode replayMode = batchOptions.deleteAfterReplay() ? ReplayMode.REPLAY_AND_DELETE : ReplayMode.REPLAY_ONLY;
+        List<MapRecord<String, Object, Object>> matchingRecords = records(entityType).stream()
+                .filter(record -> failedStore != null && failedStore.equals(value(record, DLQ_FAILED_STORE_KEY)))
+                .filter(record -> olderThan(record, batchOptions.olderThan()))
+                .limit(batchOptions.limit())
+                .toList();
+        List<KinexisReplayResult> results = new ArrayList<>();
+        for (int index = 0; index < matchingRecords.size(); index++) {
+            MapRecord<String, Object, Object> record = matchingRecords.get(index);
+            KinexisReplayResult result = replayFailedStoreResult(
+                    entityType,
+                    record.getId().getValue(),
+                    replayMode,
+                    batchOptions.replayOptions());
+            results.add(result);
+            if (batchOptions.stopOnFirstFailure() && result.status() != KinexisReplayStatus.REPLAYED) {
+                break;
+            }
+            if (index < matchingRecords.size() - 1) {
+                delay(batchOptions.delayBetweenRecords());
+            }
+        }
+        return List.copyOf(results);
+    }
+
+    public KinexisReplayPlan previewReplayByStore(Class<?> entityType, String failedStore) {
+        return previewReplayByStore(entityType, failedStore, KinexisReplayOptions.safe());
+    }
+
+    public KinexisReplayPlan previewReplayByStore(Class<?> entityType,
+                                                  String failedStore,
+                                                  KinexisReplayOptions options) {
+        List<MapRecord<String, Object, Object>> matchingRecords = records(entityType).stream()
+                .filter(record -> failedStore != null && failedStore.equals(value(record, DLQ_FAILED_STORE_KEY)))
+                .toList();
+        return previewPlan(entityType, failedStore, matchingRecords, options);
+    }
+
     public List<KinexisDlqRecord> list(Class<?> entityType) {
         return records(entityType).stream()
                 .map(this::toDlqRecord)
@@ -253,6 +311,147 @@ public class KinexisDlqService {
         return list(entityType).stream()
                 .filter(filter)
                 .toList();
+    }
+
+    private KinexisReplayPlan previewPlan(Class<?> entityType,
+                                          String failedStore,
+                                          List<MapRecord<String, Object, Object>> records,
+                                          KinexisReplayOptions options) {
+        List<KinexisReplayPlan.Record> recordPlans = records.stream()
+                .map(record -> previewRecord(entityType, record, failedStore, options))
+                .toList();
+        return new KinexisReplayPlan(
+                entityType.getName(),
+                failedStore,
+                recordPlans.size(),
+                aggregate(recordPlans, KinexisReplayPlan.Record::targetStores),
+                aggregate(recordPlans, KinexisReplayPlan.Record::alreadyProcessedStores),
+                aggregate(recordPlans, KinexisReplayPlan.Record::unhealthyStores),
+                recordPlans);
+    }
+
+    private KinexisReplayPlan.Record previewRecord(Class<?> entityType,
+                                                   MapRecord<String, Object, Object> record,
+                                                   String failedStore,
+                                                   KinexisReplayOptions options) {
+        Map<String, String> replayMessage = toReplayMessage(record);
+        List<String> targetStores = previewTargetStores(record, failedStore, replayMessage);
+        List<String> alreadyProcessedStores = alreadyProcessedStores(entityType, replayMessage.get(EVENT_ID_KEY), targetStores);
+        Map<String, KinexisStoreHealthStatus> unhealthyStatuses = unhealthyStatuses(entityType, targetStores);
+        SchemaPreview schemaPreview = schemaPreview(entityType, record, replayMessage);
+        String skipReason = skipReason(replayMessage, targetStores, alreadyProcessedStores, unhealthyStatuses, schemaPreview, options);
+        boolean wouldSkip = !skipReason.isBlank();
+        return new KinexisReplayPlan.Record(
+                record.getId().getValue(),
+                replayMessage.get(EVENT_ID_KEY),
+                replayMessage.get(EVENT_ENTITY_ID_KEY),
+                replayMessage.get(EVENT_OPERATION_KEY),
+                value(record, DLQ_FAILED_STORE_KEY),
+                targetStores,
+                alreadyProcessedStores,
+                new ArrayList<>(unhealthyStatuses.keySet()),
+                wouldSkip,
+                skipReason,
+                !wouldSkip,
+                schemaPreview.requiresUpcast(),
+                schemaPreview.fromVersion(),
+                schemaPreview.toVersion());
+    }
+
+    private List<String> previewTargetStores(MapRecord<String, Object, Object> record,
+                                             String failedStore,
+                                             Map<String, String> replayMessage) {
+        if (failedStore != null && !failedStore.isBlank()) {
+            return List.of(failedStore);
+        }
+        String recordFailedStore = value(record, DLQ_FAILED_STORE_KEY);
+        if (recordFailedStore != null && !recordFailedStore.isBlank()) {
+            return List.of(recordFailedStore);
+        }
+        return KinexisEvent.targets(replayMessage);
+    }
+
+    private List<String> alreadyProcessedStores(Class<?> entityType, String eventId, List<String> targetStores) {
+        if (processingCoordinator == null || eventId == null || eventId.isBlank()) {
+            return List.of();
+        }
+        return targetStores.stream()
+                .filter(store -> processingCoordinator.isProcessed(entityType, eventId, store))
+                .toList();
+    }
+
+    private Map<String, KinexisStoreHealthStatus> unhealthyStatuses(Class<?> entityType, List<String> targetStores) {
+        Map<String, KinexisStoreHealthStatus> statuses = new HashMap<>();
+        for (String store : targetStores) {
+            KinexisStoreHealthStatus status = storeControl.status(entityType, store);
+            if (!status.available()) {
+                statuses.put(store, status);
+            }
+        }
+        return statuses;
+    }
+
+    private SchemaPreview schemaPreview(Class<?> entityType,
+                                        MapRecord<String, Object, Object> record,
+                                        Map<String, String> replayMessage) {
+        String fromVersion = replayMessage.getOrDefault(KinexisEvent.EVENT_SCHEMA_VERSION_KEY, KinexisEvent.CURRENT_SCHEMA_VERSION);
+        String toVersion = fromVersion;
+        boolean requiresUpcast = false;
+        String failureReason = "";
+        try {
+            KinexisEventEnvelope envelope = eventSchemaRegistry.upcast(KinexisEventEnvelope.from(
+                    replayMessage,
+                    record.getId().getValue(),
+                    entityType));
+            toVersion = envelope.schemaVersion();
+            requiresUpcast = !fromVersion.equals(toVersion);
+        } catch (RuntimeException e) {
+            toVersion = currentSchemaVersion(entityType);
+            requiresUpcast = !fromVersion.equals(toVersion);
+            failureReason = "schemaUpcastFailed:" + e.getClass().getName();
+        }
+        return new SchemaPreview(fromVersion, toVersion, requiresUpcast, failureReason);
+    }
+
+    private String currentSchemaVersion(Class<?> entityType) {
+        String currentVersion = eventSchemaRegistry.currentVersion(entityType.getName());
+        if (currentVersion == null || currentVersion.isBlank()) {
+            return KinexisEvent.CURRENT_SCHEMA_VERSION;
+        }
+        return currentVersion.trim();
+    }
+
+    private String skipReason(Map<String, String> replayMessage,
+                              List<String> targetStores,
+                              List<String> alreadyProcessedStores,
+                              Map<String, KinexisStoreHealthStatus> unhealthyStatuses,
+                              SchemaPreview schemaPreview,
+                              KinexisReplayOptions options) {
+        if (!replayMessage.containsKey(EVENT_CONTENT_KEY) || !replayMessage.containsKey(EVENT_OPERATION_KEY)) {
+            return "notReplayable";
+        }
+        if (!schemaPreview.failureReason().isBlank()) {
+            return schemaPreview.failureReason();
+        }
+        if (!targetStores.isEmpty() && alreadyProcessedStores.containsAll(targetStores)) {
+            return "alreadyProcessed";
+        }
+        if ((options == null || !options.force()) && !unhealthyStatuses.isEmpty()) {
+            return "unhealthyStore:" + unhealthyStatuses.values().stream()
+                    .findFirst()
+                    .map(status -> status.state().name())
+                    .orElse("");
+        }
+        return "";
+    }
+
+    private List<String> aggregate(List<KinexisReplayPlan.Record> records,
+                                   java.util.function.Function<KinexisReplayPlan.Record, List<String>> values) {
+        Set<String> aggregate = new LinkedHashSet<>();
+        for (KinexisReplayPlan.Record record : records) {
+            aggregate.addAll(values.apply(record));
+        }
+        return List.copyOf(aggregate);
     }
 
     private Optional<String> replay(Class<?> entityType, String dlqRecordId, ReplayMode replayMode, boolean newEventId, String... targets) {
@@ -424,6 +623,26 @@ public class KinexisDlqService {
         }
     }
 
+    private boolean olderThan(MapRecord<String, Object, Object> record, Duration age) {
+        if (age == null) {
+            return true;
+        }
+        Instant failureTimestamp = parseInstant(value(record, DLQ_FAILURE_TIMESTAMP_KEY));
+        return failureTimestamp != null && failureTimestamp.isBefore(Instant.now().minus(age));
+    }
+
+    private void delay(Duration delay) {
+        if (delay == null || delay.isZero() || delay.isNegative()) {
+            return;
+        }
+        try {
+            Thread.sleep(delay.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while delaying DLQ batch replay", e);
+        }
+    }
+
     private Instant parseInstant(String value) {
         if (value == null || value.isBlank()) {
             return null;
@@ -465,5 +684,8 @@ public class KinexisDlqService {
                 DLQ_EXCEPTION_CLASS_KEY,
                 DLQ_FAILURE_TIMESTAMP_KEY
         );
+    }
+
+    private record SchemaPreview(String fromVersion, String toVersion, boolean requiresUpcast, String failureReason) {
     }
 }

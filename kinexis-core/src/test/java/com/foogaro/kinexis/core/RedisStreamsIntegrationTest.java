@@ -14,9 +14,12 @@ import com.foogaro.kinexis.core.model.KinexisDlqRecord;
 import com.foogaro.kinexis.core.model.KinexisEvent;
 import com.foogaro.kinexis.core.model.KinexisEventEnvelope;
 import com.foogaro.kinexis.core.model.KinexisReplayOptions;
+import com.foogaro.kinexis.core.model.KinexisReplayPlan;
 import com.foogaro.kinexis.core.model.KinexisReplayResult;
 import com.foogaro.kinexis.core.model.KinexisReplayStatus;
 import com.foogaro.kinexis.core.model.KinexisStoreHealthState;
+import com.foogaro.kinexis.core.model.StoreHealthCheckResult;
+import com.foogaro.kinexis.core.model.ReplayBatchOptions;
 import com.foogaro.kinexis.core.processor.AbstractProcessor;
 import com.foogaro.kinexis.core.processor.KinexisProcessingCoordinator;
 import com.foogaro.kinexis.core.processor.KinexisProcessingMetrics;
@@ -33,6 +36,7 @@ import com.foogaro.kinexis.core.store.EmptyEntityStoreRegistry;
 import com.foogaro.kinexis.core.store.EntityStore;
 import com.foogaro.kinexis.core.store.EntityStoreRegistry;
 import com.foogaro.kinexis.core.store.RedisOmCacheStore;
+import com.foogaro.kinexis.core.store.StoreHealthCheck;
 import com.foogaro.kinexis.core.service.BeanFinder;
 import com.foogaro.kinexis.core.service.KinexisDlqService;
 import com.foogaro.kinexis.core.service.KinexisDiagnosticsService;
@@ -67,6 +71,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.lang.reflect.Field;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -342,6 +347,83 @@ class RedisStreamsIntegrationTest {
         KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
         assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_PROBE_SUCCESSES, Map.of("store", "backing")));
         assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_CIRCUIT_CLOSED, Map.of("store", "backing")));
+    }
+
+    @Test
+    void storeControlRunsRegisteredHealthCheckAndRecordsDiagnosticResult() {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStoreHealth().setFailureThreshold(2);
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        TestHealthCheck healthCheck = new TestHealthCheck(TestEntity.class, "checked");
+        storeControl.registerHealthCheck(healthCheck);
+
+        healthCheck.unhealthy("database unavailable");
+        Optional<StoreHealthCheckResult> result = storeControl.check(TestEntity.class, "checked");
+
+        assertTrue(result.isPresent());
+        assertFalse(result.orElseThrow().healthy());
+        assertEquals("database unavailable", result.orElseThrow().reason());
+        assertEquals(1, healthCheck.checkCount());
+        assertEquals(KinexisStoreHealthState.DEGRADED, storeControl.status(TestEntity.class, "checked").state());
+        assertEquals("database unavailable", storeControl.status(TestEntity.class, "checked").lastHealthCheckResult().reason());
+        assertNotNull(storeControl.status(TestEntity.class, "checked").lastHealthCheckAt());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_PROBE_FAILURES, Map.of("store", "checked")));
+    }
+
+    @Test
+    void storeControlActiveHealthCheckRecoversOpenCircuitStore() {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStoreHealth().setFailureThreshold(1);
+        properties.getStoreHealth().setOpenDuration(Duration.ZERO);
+        properties.getStoreHealth().setProbeSuccessThreshold(1);
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        TestHealthCheck healthCheck = new TestHealthCheck(TestEntity.class, "checked");
+        storeControl.registerHealthCheck(healthCheck);
+
+        healthCheck.unhealthy("down");
+        assertEquals(KinexisStoreHealthState.RECOVERING, storeControl.checkStatus(TestEntity.class, "checked").state());
+
+        healthCheck.healthy("ready");
+        assertEquals(KinexisStoreHealthState.ACTIVE, storeControl.checkStatus(TestEntity.class, "checked").state());
+        assertEquals("ready", storeControl.status(TestEntity.class, "checked").lastHealthCheckResult().reason());
+
+        KinexisTelemetrySnapshot snapshot = telemetry.snapshot();
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_PROBE_FAILURES, Map.of("store", "checked")));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_PROBE_SUCCESSES, Map.of("store", "checked")));
+        assertEquals(1, counter(snapshot, KinexisTelemetry.STORE_CIRCUIT_CLOSED, Map.of("store", "checked")));
+    }
+
+    @Test
+    void processorRunsStoreHealthCheckBeforeWriteAndSkipsUnavailableStore() throws Exception {
+        KinexisProperties properties = new KinexisProperties();
+        properties.getStoreHealth().setFailureThreshold(1);
+        properties.getStoreHealth().setOpenDuration(Duration.ofDays(1));
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        HealthCheckedCountingStore checkedStore = new HealthCheckedCountingStore("checked");
+        checkedStore.unhealthy("connection refused");
+        storeControl.registerHealthChecks(List.of(checkedStore), List.of());
+        inject(processor, "telemetry", telemetry);
+        inject(processor, "storeControl", storeControl);
+        inject(processor, "entityStoreRegistry", new DefaultEntityStoreRegistry(
+                List.of(checkedStore),
+                new EmptyEntityStoreRegistry()));
+
+        ProcessMessageException exception = assertThrows(ProcessMessageException.class, () -> processor.process(streamRecord(KinexisEvent.save(
+                TestEntity.class,
+                72L,
+                objectMapper.writeValueAsString(new TestEntity(72L, "Checked"))))));
+
+        assertEquals(List.of("checked"), exception.getFailedStores());
+        assertEquals(1, checkedStore.checkCount());
+        assertEquals(0, checkedStore.saveCount());
+        assertTrue(checkedStore.findById(72L).isEmpty());
+        assertEquals(KinexisStoreHealthState.OPEN_CIRCUIT, storeControl.status(TestEntity.class, "checked").state());
+        assertEquals("connection refused", storeControl.status(TestEntity.class, "checked").lastHealthCheckResult().reason());
     }
 
     @Test
@@ -1253,6 +1335,255 @@ class RedisStreamsIntegrationTest {
     }
 
     @Test
+    void dlqPreviewReplayByStoreReportsIdempotencyAndSchemaUpcastWithoutAppending() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisProperties properties = new KinexisProperties();
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        KinexisProcessingCoordinator coordinator = new KinexisProcessingCoordinator(redisTemplate, properties);
+        KinexisEventSchemaRegistry schemaRegistry = eventSchemaRegistry("2", new LegacyNameUpcaster());
+        String processedDlqRecordId = addDlqRecord(
+                19L,
+                objectMapper.writeValueAsString(new TestEntity(19L, "AlreadyDone")),
+                "mysql",
+                "2");
+        String upcastDlqRecordId = addDlqRecord(
+                20L,
+                "{\"id\":20,\"legacyName\":\"NeedsUpcast\"}",
+                "mysql",
+                "1");
+        KinexisDlqService dlqService = new KinexisDlqService(
+                redisTemplate,
+                telemetry,
+                storeControl,
+                schemaRegistry,
+                coordinator);
+        KinexisDlqRecord processedRecord = dlqService.listByFailedStore(TestEntity.class, "mysql").stream()
+                .filter(record -> processedDlqRecordId.equals(record.recordId()))
+                .findFirst()
+                .orElseThrow();
+        coordinator.markProcessed(TestEntity.class, processedRecord.eventId(), "mysql");
+
+        KinexisReplayPlan plan = dlqService.previewReplayByStore(TestEntity.class, "mysql");
+
+        assertEquals(TestEntity.class.getName(), plan.entityType());
+        assertEquals("mysql", plan.failedStore());
+        assertEquals(2, plan.recordsFound());
+        assertEquals(List.of("mysql"), plan.targetStores());
+        assertEquals(List.of("mysql"), plan.storesAlreadyProcessed());
+        assertTrue(plan.storesUnhealthy().isEmpty());
+        assertEquals(1, plan.recordsSkipped());
+        assertEquals(1, plan.recordsReplayed());
+        assertEquals(1, plan.recordsRequiringSchemaUpcast());
+
+        KinexisReplayPlan.Record processedPreview = plan.records().stream()
+                .filter(record -> processedDlqRecordId.equals(record.recordId()))
+                .findFirst()
+                .orElseThrow();
+        assertTrue(processedPreview.wouldSkip());
+        assertFalse(processedPreview.wouldReplay());
+        assertEquals("alreadyProcessed", processedPreview.skipReason());
+        assertEquals(List.of("mysql"), processedPreview.alreadyProcessedStores());
+        assertFalse(processedPreview.requiresSchemaUpcast());
+        assertEquals("2", processedPreview.fromSchemaVersion());
+        assertEquals("2", processedPreview.toSchemaVersion());
+
+        KinexisReplayPlan.Record upcastPreview = plan.records().stream()
+                .filter(record -> upcastDlqRecordId.equals(record.recordId()))
+                .findFirst()
+                .orElseThrow();
+        assertFalse(upcastPreview.wouldSkip());
+        assertTrue(upcastPreview.wouldReplay());
+        assertTrue(upcastPreview.requiresSchemaUpcast());
+        assertEquals("1", upcastPreview.fromSchemaVersion());
+        assertEquals("2", upcastPreview.toSchemaVersion());
+
+        List<MapRecord<String, Object, Object>> streamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(streamRecords);
+        assertTrue(streamRecords.isEmpty());
+    }
+
+    @Test
+    void dlqPreviewReplayByStoreReportsUnhealthyStoresAndForcedPlan() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisProperties properties = new KinexisProperties();
+        KinexisStoreControl storeControl = new KinexisStoreControl(properties, telemetry);
+        KinexisProcessingCoordinator coordinator = new KinexisProcessingCoordinator(redisTemplate, properties);
+        String dlqRecordId = addDlqRecord(23L, "PausedPreview", "mysql");
+        KinexisDlqService dlqService = new KinexisDlqService(
+                redisTemplate,
+                telemetry,
+                storeControl,
+                KinexisEventSchemaRegistry.noop(),
+                coordinator);
+
+        storeControl.pause(TestEntity.class, "mysql");
+
+        KinexisReplayPlan safePlan = dlqService.previewReplayByStore(TestEntity.class, "mysql");
+
+        assertEquals(1, safePlan.recordsFound());
+        assertEquals(1, safePlan.recordsSkipped());
+        assertEquals(0, safePlan.recordsReplayed());
+        assertEquals(List.of("mysql"), safePlan.storesUnhealthy());
+        KinexisReplayPlan.Record safeRecord = safePlan.records().getFirst();
+        assertEquals(dlqRecordId, safeRecord.recordId());
+        assertTrue(safeRecord.wouldSkip());
+        assertEquals("unhealthyStore:" + KinexisStoreHealthState.PAUSED.name(), safeRecord.skipReason());
+        assertEquals(List.of("mysql"), safeRecord.unhealthyStores());
+
+        KinexisReplayPlan forcedPlan = dlqService.previewReplayByStore(
+                TestEntity.class,
+                "mysql",
+                KinexisReplayOptions.forced());
+
+        assertEquals(1, forcedPlan.recordsFound());
+        assertEquals(0, forcedPlan.recordsSkipped());
+        assertEquals(1, forcedPlan.recordsReplayed());
+        assertEquals(List.of("mysql"), forcedPlan.storesUnhealthy());
+        assertFalse(forcedPlan.records().getFirst().wouldSkip());
+        assertTrue(forcedPlan.records().getFirst().wouldReplay());
+
+        List<MapRecord<String, Object, Object>> streamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(streamRecords);
+        assertTrue(streamRecords.isEmpty());
+    }
+
+    @Test
+    void dlqBatchReplayByStoreAppliesLimitAgeFilterAndDeletesAfterReplay() throws Exception {
+        String oldRecordOne = addDlqRecord(24L, "BatchOldOne", "mysql", Instant.now().minusSeconds(10));
+        String oldRecordTwo = addDlqRecord(25L, "BatchOldTwo", "mysql", Instant.now().minusSeconds(10));
+        String newRecord = addDlqRecord(26L, "BatchNew", "mysql", Instant.now());
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate);
+
+        List<KinexisReplayResult> results = dlqService.replayByStore(
+                TestEntity.class,
+                "mysql",
+                new ReplayBatchOptions(
+                        1,
+                        Duration.ofSeconds(1),
+                        true,
+                        false,
+                        Duration.ZERO,
+                        KinexisReplayOptions.safe()));
+
+        assertEquals(1, results.size());
+        assertEquals(KinexisReplayStatus.REPLAYED, results.getFirst().status());
+        assertEquals(oldRecordOne, results.getFirst().dlqRecordId());
+        assertNotNull(results.getFirst().replayedRecordId());
+
+        List<KinexisDlqRecord> remaining = dlqService.listByFailedStore(TestEntity.class, "mysql");
+        assertEquals(Set.of(oldRecordTwo, newRecord), remaining.stream()
+                .map(KinexisDlqRecord::recordId)
+                .collect(java.util.stream.Collectors.toSet()));
+        List<MapRecord<String, Object, Object>> streamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(streamRecords);
+        assertEquals(1, streamRecords.size());
+        assertEquals("mysql", streamRecords.getFirst().getValue().get(KinexisEvent.EVENT_TARGETS_KEY));
+    }
+
+    @Test
+    void dlqBatchReplayByStoreStopsOnFirstFailure() throws Exception {
+        String malformedRecord = addMalformedDlqRecord("mysql");
+        addDlqRecord(27L, "BatchAfterFailure", "mysql");
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate);
+
+        List<KinexisReplayResult> results = dlqService.replayByStore(
+                TestEntity.class,
+                "mysql",
+                new ReplayBatchOptions(
+                        10,
+                        null,
+                        false,
+                        true,
+                        Duration.ZERO,
+                        KinexisReplayOptions.safe()));
+
+        assertEquals(1, results.size());
+        assertEquals(malformedRecord, results.getFirst().dlqRecordId());
+        assertEquals(KinexisReplayStatus.FAILED, results.getFirst().status());
+        assertEquals(IllegalArgumentException.class.getName(), results.getFirst().reason());
+        List<MapRecord<String, Object, Object>> streamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(streamRecords);
+        assertTrue(streamRecords.isEmpty());
+        assertEquals(2, dlqService.listByFailedStore(TestEntity.class, "mysql").size());
+    }
+
+    @Test
+    void dlqBatchReplayByStoreContinuesAfterFailureWhenConfigured() throws Exception {
+        String malformedRecord = addMalformedDlqRecord("mysql");
+        String validRecord = addDlqRecord(28L, "BatchContinue", "mysql");
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate);
+
+        List<KinexisReplayResult> results = dlqService.replayByStore(
+                TestEntity.class,
+                "mysql",
+                new ReplayBatchOptions(
+                        10,
+                        null,
+                        false,
+                        false,
+                        Duration.ZERO,
+                        KinexisReplayOptions.safe()));
+
+        assertEquals(2, results.size());
+        assertEquals(malformedRecord, results.getFirst().dlqRecordId());
+        assertEquals(KinexisReplayStatus.FAILED, results.getFirst().status());
+        assertEquals(validRecord, results.getLast().dlqRecordId());
+        assertEquals(KinexisReplayStatus.REPLAYED, results.getLast().status());
+        List<MapRecord<String, Object, Object>> streamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(streamRecords);
+        assertEquals(1, streamRecords.size());
+        assertEquals("mysql", streamRecords.getFirst().getValue().get(KinexisEvent.EVENT_TARGETS_KEY));
+    }
+
+    @Test
+    void dlqBatchReplayByStoreHonorsReplayOptionsAndDelayBetweenRecords() throws Exception {
+        SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
+        KinexisStoreControl storeControl = new KinexisStoreControl(new KinexisProperties(), telemetry);
+        addDlqRecord(29L, "BatchPausedOne", "mysql");
+        addDlqRecord(30L, "BatchPausedTwo", "mysql");
+        KinexisDlqService dlqService = new KinexisDlqService(redisTemplate, telemetry, storeControl);
+
+        storeControl.pause(TestEntity.class, "mysql");
+        List<KinexisReplayResult> safeResults = dlqService.replayByStore(
+                TestEntity.class,
+                "mysql",
+                ReplayBatchOptions.limited(2));
+
+        assertEquals(2, safeResults.size());
+        assertTrue(safeResults.stream().allMatch(result -> result.status() == KinexisReplayStatus.SKIPPED_UNHEALTHY_STORE));
+        List<MapRecord<String, Object, Object>> safeStreamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(safeStreamRecords);
+        assertTrue(safeStreamRecords.isEmpty());
+
+        long started = System.nanoTime();
+        List<KinexisReplayResult> forcedResults = dlqService.replayByStore(
+                TestEntity.class,
+                "mysql",
+                new ReplayBatchOptions(
+                        2,
+                        null,
+                        false,
+                        false,
+                        Duration.ofMillis(50),
+                        KinexisReplayOptions.forced()));
+        long elapsedMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertEquals(2, forcedResults.size());
+        assertTrue(forcedResults.stream().allMatch(result -> result.status() == KinexisReplayStatus.REPLAYED));
+        assertTrue(elapsedMillis >= 40);
+        List<MapRecord<String, Object, Object>> forcedStreamRecords = redisTemplate.opsForStream()
+                .range(Misc.getStreamKey(TestEntity.class), Range.unbounded());
+        assertNotNull(forcedStreamRecords);
+        assertEquals(2, forcedStreamRecords.size());
+    }
+
+    @Test
     void dlqReplayUpcastsOldSchemaRecordBeforeAppendingToStream() throws Exception {
         SimpleKinexisTelemetry telemetry = new SimpleKinexisTelemetry();
         KinexisEventSchemaRegistry schemaRegistry = eventSchemaRegistry("2", new LegacyNameUpcaster());
@@ -1491,7 +1822,24 @@ class RedisStreamsIntegrationTest {
                 KinexisEvent.CURRENT_SCHEMA_VERSION);
     }
 
+    private String addDlqRecord(long entityId, String name, String failedStore, Instant failureTimestamp) throws Exception {
+        return addDlqRecord(
+                entityId,
+                objectMapper.writeValueAsString(new TestEntity(entityId, name)),
+                failedStore,
+                KinexisEvent.CURRENT_SCHEMA_VERSION,
+                failureTimestamp);
+    }
+
     private String addDlqRecord(long entityId, String content, String failedStore, String schemaVersion) {
+        return addDlqRecord(entityId, content, failedStore, schemaVersion, Instant.now());
+    }
+
+    private String addDlqRecord(long entityId,
+                                String content,
+                                String failedStore,
+                                String schemaVersion,
+                                Instant failureTimestamp) {
         Map<String, String> dlqRecord = new java.util.HashMap<>(KinexisEvent.save(
                 TestEntity.class,
                 entityId,
@@ -1506,7 +1854,28 @@ class RedisStreamsIntegrationTest {
         dlqRecord.put(AbstractPendingMessageHandler.DLQ_ATTEMPTS_KEY, "1");
         dlqRecord.put(AbstractPendingMessageHandler.DLQ_FAILED_STORE_KEY, failedStore);
         dlqRecord.put(AbstractPendingMessageHandler.DLQ_EXCEPTION_CLASS_KEY, IllegalStateException.class.getName());
-        dlqRecord.put(AbstractPendingMessageHandler.DLQ_FAILURE_TIMESTAMP_KEY, java.time.Instant.now().toString());
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_FAILURE_TIMESTAMP_KEY, failureTimestamp.toString());
+        RecordId recordId = redisTemplate.opsForStream().add(StreamRecords.newRecord()
+                .withId(RecordId.autoGenerate())
+                .ofMap(dlqRecord)
+                .withStreamKey(Misc.getDLQStreamKey(TestEntity.class)));
+        assertNotNull(recordId);
+        return recordId.getValue();
+    }
+
+    private String addMalformedDlqRecord(String failedStore) {
+        Map<String, String> dlqRecord = new java.util.HashMap<>();
+        dlqRecord.put(KinexisEvent.EVENT_ENTITY_TYPE_KEY, TestEntity.class.getName());
+        dlqRecord.put(KinexisEvent.EVENT_ENTITY_ID_KEY, "malformed");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_REASON_KEY, "manual");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_STREAM_KEY, Misc.getStreamKey(TestEntity.class));
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_STREAM_ID_KEY, "malformed-0");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_CONSUMER_KEY, "test-consumer");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_GROUP_KEY, "test-group");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_ATTEMPTS_KEY, "1");
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_FAILED_STORE_KEY, failedStore);
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_EXCEPTION_CLASS_KEY, IllegalArgumentException.class.getName());
+        dlqRecord.put(AbstractPendingMessageHandler.DLQ_FAILURE_TIMESTAMP_KEY, Instant.now().toString());
         RecordId recordId = redisTemplate.opsForStream().add(StreamRecords.newRecord()
                 .withId(RecordId.autoGenerate())
                 .ofMap(dlqRecord)
@@ -1979,7 +2348,7 @@ class RedisStreamsIntegrationTest {
         }
     }
 
-    private static final class CountingStore extends InMemoryStore {
+    private static class CountingStore extends InMemoryStore {
 
         private final AtomicInteger saveCount = new AtomicInteger();
 
@@ -1998,8 +2367,77 @@ class RedisStreamsIntegrationTest {
             return saved;
         }
 
-        private int saveCount() {
+        int saveCount() {
             return saveCount.get();
+        }
+    }
+
+    private static final class HealthCheckedCountingStore extends CountingStore implements StoreHealthCheck {
+
+        private final AtomicInteger checkCount = new AtomicInteger();
+        private StoreHealthCheckResult nextResult = StoreHealthCheckResult.up();
+
+        private HealthCheckedCountingStore(String name) {
+            super(name);
+        }
+
+        private void healthy(String reason) {
+            nextResult = StoreHealthCheckResult.up(reason);
+        }
+
+        private void unhealthy(String reason) {
+            nextResult = StoreHealthCheckResult.unhealthy(reason);
+        }
+
+        @Override
+        public StoreHealthCheckResult check() {
+            checkCount.incrementAndGet();
+            return nextResult;
+        }
+
+        private int checkCount() {
+            return checkCount.get();
+        }
+    }
+
+    private static final class TestHealthCheck implements StoreHealthCheck {
+
+        private final Class<?> entityType;
+        private final String storeName;
+        private final AtomicInteger checkCount = new AtomicInteger();
+        private StoreHealthCheckResult nextResult = StoreHealthCheckResult.up();
+
+        private TestHealthCheck(Class<?> entityType, String storeName) {
+            this.entityType = entityType;
+            this.storeName = storeName;
+        }
+
+        private void healthy(String reason) {
+            nextResult = StoreHealthCheckResult.up(reason);
+        }
+
+        private void unhealthy(String reason) {
+            nextResult = StoreHealthCheckResult.unhealthy(reason);
+        }
+
+        @Override
+        public StoreHealthCheckResult check() {
+            checkCount.incrementAndGet();
+            return nextResult;
+        }
+
+        @Override
+        public Optional<Class<?>> checkedEntityType() {
+            return Optional.of(entityType);
+        }
+
+        @Override
+        public Optional<String> checkedStoreName() {
+            return Optional.of(storeName);
+        }
+
+        private int checkCount() {
+            return checkCount.get();
         }
     }
 

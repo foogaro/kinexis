@@ -117,7 +117,7 @@
     {
       "name": "kinexis.store-health.enabled",
       "type": "java.lang.Boolean",
-      "description": "Enables per-store health state, manual pause/resume, and automatic circuit breaking for target stores.",
+      "description": "Enables per-store health state, manual pause/resume, active health checks, and automatic circuit breaking for target stores.",
       "defaultValue": true
     },
     {
