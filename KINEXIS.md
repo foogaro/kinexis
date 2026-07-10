@@ -27,7 +27,7 @@ Prefer the BOM when using split modules:
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.5.0</version>
+            <version>2.6.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -52,16 +52,6 @@ For a Spring Boot application with Redis Streams and explicit stores:
         <artifactId>kinexis-redis-om</artifactId>
     </dependency>
 </dependencies>
-```
-
-If you prefer the compatibility bundle:
-
-```xml
-<dependency>
-    <groupId>io.github.foogaro</groupId>
-    <artifactId>kinexis-core</artifactId>
-    <version>2.5.0</version>
-</dependency>
 ```
 
 You still add your own Spring Boot database dependencies, for example Spring Data JPA plus MySQL and PostgreSQL drivers.

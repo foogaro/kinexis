@@ -1,4 +1,4 @@
-[![Maven Central](https://img.shields.io/maven-central/v/io.github.foogaro/kinexis-core.svg)](https://search.maven.org/artifact/io.github.foogaro/kinexis-core)
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.foogaro/kinexis-api.svg)](https://search.maven.org/artifact/io.github.foogaro/kinexis-api)
 
 # Kinexis
 
@@ -19,7 +19,7 @@ Kinexis is split so applications can choose the smallest dependency surface that
 | `kinexis-spring` | `KinexisService<T>`, annotation inspection, Spring bean discovery, Spring Data `CrudRepository` adapters, and optional Micrometer bridge. | Spring Context, Spring Data Commons, Jackson. |
 | `kinexis-redis-streams` | Redis Streams publisher, generated-listener base classes, processors, pending retry, DLQ, replay, idempotency, partitioning, backpressure, validation, diagnostics, and Spring Redis configuration. | Spring Data Redis, Lettuce, Spring Boot autoconfigure. |
 | `kinexis-redis-om` | Redis OM cache adapter and the annotation processor that generates Redis OM repositories plus entity stream components. | Redis OM Spring, JavaPoet, Kinexis Redis Streams runtime. |
-| `kinexis-core` | Backward-compatible bundle for users that want one dependency. | Depends on all modules above. |
+| `kinexis-integration-tests` | Repository-only integration and generated-code compatibility tests. | Not published; not part of the BOM. |
 
 Existing imports remain stable. Even when using the split modules, public classes still live under packages such as `com.foogaro.kinexis.core.service`, `com.foogaro.kinexis.core.store`, and `com.foogaro.kinexis.core.model`.
 
@@ -57,7 +57,7 @@ Use `kinexis-bom` to align split module versions from one place.
         <dependency>
             <groupId>io.github.foogaro</groupId>
             <artifactId>kinexis-bom</artifactId>
-            <version>2.5.0</version>
+            <version>2.6.0</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -78,20 +78,6 @@ After importing the BOM, omit versions on Kinexis dependencies:
 </dependency>
 ```
 
-### Compatibility Bundle
-
-Use `kinexis-core` when you want the same one-dependency setup as earlier releases.
-
-```xml
-<dependency>
-    <groupId>io.github.foogaro</groupId>
-    <artifactId>kinexis-core</artifactId>
-    <version>2.5.0</version>
-</dependency>
-```
-
-This brings `kinexis-api`, `kinexis-spring`, `kinexis-redis-streams`, and `kinexis-redis-om`.
-
 ### API Only
 
 Use `kinexis-api` if you only need annotations, event metadata, store contracts, or telemetry contracts.
@@ -100,7 +86,7 @@ Use `kinexis-api` if you only need annotations, event metadata, store contracts,
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-api</artifactId>
-    <version>2.5.0</version>
+    <version>2.6.0</version>
 </dependency>
 ```
 
@@ -114,12 +100,12 @@ Use this set when your application wants `KinexisService<T>`, explicit stores, a
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-spring</artifactId>
-    <version>2.5.0</version>
+    <version>2.6.0</version>
 </dependency>
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-streams</artifactId>
-    <version>2.5.0</version>
+    <version>2.6.0</version>
 </dependency>
 ```
 
@@ -131,7 +117,7 @@ Use this set when you want the annotation processor to generate Redis OM reposit
 <dependency>
     <groupId>io.github.foogaro</groupId>
     <artifactId>kinexis-redis-om</artifactId>
-    <version>2.5.0</version>
+    <version>2.6.0</version>
 </dependency>
 ```
 
@@ -144,7 +130,7 @@ If your Maven build uses explicit annotation processor paths, add `kinexis-redis
     <path>
         <groupId>io.github.foogaro</groupId>
         <artifactId>kinexis-redis-om</artifactId>
-        <version>2.5.0</version>
+        <version>2.6.0</version>
     </path>
 </annotationProcessorPaths>
 ```
@@ -1073,10 +1059,10 @@ Run the full test suite:
 ./mvnw clean test
 ```
 
-Run only the compatibility bundle and its integration tests:
+Run only Kinexis integration and generated-code compatibility tests:
 
 ```bash
-./mvnw -pl kinexis-core -am test
+./mvnw -pl kinexis-integration-tests -am test
 ```
 
 Run a demo module:
